@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+option go_package = "distributedFileSystem/pkg/proto/client";
+
+package client;
+
+
+service FileSaving  {
+    rpc RequestNodeIPs (RequestNodeIPsRequest) returns (RequestNodeIPsResponse);
+
+}
+
+message RequestNodeIPsRequest{
+    int32 chunkNumber = 1;
+    int32 chunkSize = 2;
+    string fileName = 3;
+    string userName = 4;
+}
+
+message ReplicaSet {
+    repeated string node_ips = 1; 
+}
+
+message RequestNodeIPsResponse{
+    repeated ReplicaSet ipAddress = 1;
+}

@@ -7,10 +7,10 @@ import (
 	"os"
 )
 
-const defaultPartitionSize = 4 * 1024 
+const defaultPartitionSize = 4 * 1024 * 1024
 
 func main() {
-	chunks, err := partition("C:/Users/david/Documents/DistributedSystems/Proyect1/SI3007-262-proyecto1-dfs-beta.pdf")
+	chunks, err := partition("")
 	if err != nil {
 		log.Fatalf("Partition failed: %v", err)
 	}
