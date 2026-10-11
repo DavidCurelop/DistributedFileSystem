@@ -4,7 +4,6 @@ option go_package = "distributedFileSystem/pkg/proto/client";
 
 package client;
 
-
 service FileSaving  {
     rpc RequestNodeIPs (RequestNodeIPsRequest) returns (RequestNodeIPsResponse);
 

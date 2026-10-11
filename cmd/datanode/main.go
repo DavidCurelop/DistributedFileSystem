@@ -6,6 +6,7 @@ import (
 	pb "distributedFileSystem/pkg/proto/datanode"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -66,5 +68,50 @@ func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkReque
 		return nil, status.Errorf(codes.Internal, "writing chunk %q to disk: %v", req.ChunkId, err)
 	}
 
+	if len(req.ReplicaTargets) > 0 {
+		err = s.forwardToNextReplica(ctx, req.ReplicaTargets[0], req, req.ReplicaTargets[1:])
+
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "replicating to next target %q %v", req.ReplicaTargets[0], err)
+		}
+	}
+
 	return &pb.StoreChunkResponse{ChunkId: req.ChunkId, WriteSuccessful: true}, nil
+}
+
+// Structural Scaffolding for Downstream Forwarding
+func (s *dataNodeServer) forwardToNextReplica(
+	ctx context.Context,
+	downstreamAddress string,
+	req *pb.StoreChunkRequest,
+	remainingTargets []string,
+) error {
+	// TODO: Step 1 - Establish gRPC client connection to downstreamAddress
+	dataNodeConnection, err := grpc.NewClient(downstreamAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", downstreamAddress, err)
+	}
+
+	// TODO: Step 2 - Defer connection teardown or handle client lifecycle
+	defer dataNodeConnection.Close()
+
+	replicaClient := pb.NewDataNodeServiceClient(dataNodeConnection)
+	// TODO: Step 3 - Construct downstream request with updated remainingTargets
+	replicaStoreRequest := &pb.StoreChunkRequest{
+		ChunkId:        req.ChunkId,
+		ChunkPayload:   req.ChunkPayload,
+		CheckSum:       req.CheckSum,
+		ReplicaTargets: remainingTargets,
+	}
+	storeChunkResponse, err := replicaClient.StoreChunk(ctx, replicaStoreRequest)
+	// TODO: Step 4 - Execute StoreChunk RPC with propagated context
+	if err != nil {
+		return fmt.Errorf("forwarding chunk %q to %q: %w", req.ChunkId, downstreamAddress, err)
+	}
+	// TODO: Step 5 - Guard against downstream write failure and return error
+	if !storeChunkResponse.WriteSuccessful {
+		return fmt.Errorf("downstream replica %q reported write failure for chunk %q", downstreamAddress, req.ChunkId)
+	}
+
+	return nil
 }
