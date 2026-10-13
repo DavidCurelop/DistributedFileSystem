@@ -11,9 +11,12 @@ import (
 	"time"
 
 	pb "distributedFileSystem/pkg/proto/client"
+	datanodePb "distributedFileSystem/pkg/proto/datanode"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const defaultPartitionSize = 4 * 1024 * 1024
@@ -30,7 +33,7 @@ func main() {
 		ChunkNumber: int32(len(chunks)),
 		FileName:    "Lab2Vid.mp4",
 	}
-	filePartitionAddresses, err := getPartitionAddresses(controlNodeIP, chunks, *requestPayload)
+	filePartitionAddresses, err := getPartitionAddresses(controlNodeIP, requestPayload)
 	if err != nil {
 		log.Fatalf("getting partition addresses: %v", err)
 	}
@@ -41,7 +44,7 @@ func main() {
 
 }
 
-func getPartitionAddresses(controlNodeIP string, chunks [][]byte, requestPayload pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
+func getPartitionAddresses(controlNodeIP string, requestPayload *pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
 	controlNodeConnection, err := grpc.NewClient(controlNodeIP, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("connecting to server %q: %w", controlNodeIP, err)
@@ -53,7 +56,7 @@ func getPartitionAddresses(controlNodeIP string, chunks [][]byte, requestPayload
 
 	fileSavingClient := pb.NewFileSavingClient(controlNodeConnection)
 
-	response, err := fileSavingClient.RequestNodeIPs(ctx, &requestPayload)
+	response, err := fileSavingClient.RequestNodeIPs(ctx, requestPayload)
 	if err != nil {
 		return nil, fmt.Errorf("requesting node IPs: %w", err)
 	}
@@ -93,23 +96,59 @@ func partition(sourceFilePath string) ([][]byte, error) {
 	return chunks, nil
 }
 
-func sendChunk(ctx context.Context, dataNodeIP string, primaryNode string, replicaTargets []string, chunkID string, payload []byte) error {
-	// TODO: Step 1 - Compute SHA-256 hex checksum of payload
+func sendChunk(ctx context.Context, dataNodeIP string, replicaTargets []string, chunkID string, payload []byte, maxAttempts int) (*datanodePb.StoreChunkResponse, error) {
 	computeHash := sha256.Sum256(payload)
 	computeHashString := hex.EncodeToString(computeHash[:])
-	// TODO: Step 2 - Establish gRPC client connection to primaryNode and defer Close()
+
 	dataNodeConnection, err := grpc.NewClient(dataNodeIP, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", dataNodeIP, err)
+		return nil, fmt.Errorf("connecting to server %q: %w", dataNodeIP, err)
 	}
 	defer dataNodeConnection.Close()
-	// TODO: Step 3 - Instantiate datanodePb.NewDataNodeServiceClient
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 
-	fileSavingClient := pb.(dataNodeConnection)
+	storeChunkClient := datanodePb.NewDataNodeServiceClient(dataNodeConnection)
 
-	// TODO: Step 4 - Construct datanodePb.StoreChunkRequest with chunkID, payload, checksum, and replicaTargets
-	// TODO: Step 5 - Invoke StoreChunk and verify both RPC error and response.WriteSuccessful
-	return nil
+	storeChunkrequest := &datanodePb.StoreChunkRequest{
+		ChunkId:        chunkID,
+		ChunkPayload:   payload,
+		CheckSum:       computeHashString,
+		ReplicaTargets: replicaTargets,
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, 5*time.Second)
+		storeChunkResponse, err := storeChunkClient.StoreChunk(attemptCtx, storeChunkrequest)
+		cancelAttempt()
+
+		if err == nil {
+			if storeChunkResponse.GetWriteSuccessful() {
+				return storeChunkResponse, nil
+			}
+			return nil, fmt.Errorf("node %s rejected chunk %s write", dataNodeIP, chunkID)
+		}
+
+		if !isTemporary(err) || attempt == maxAttempts-1 {
+			return nil, fmt.Errorf("storing chunk %s on %s (attempt %d/%d): %w", chunkID, dataNodeIP, attempt+1, maxAttempts, err)
+		}
+
+		// Context-aware exponential backoff
+		backoffDelay := 100 * time.Millisecond * (1 << attempt)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoffDelay):
+		}
+
+	}
+
+	return nil, fmt.Errorf("max number of attempts reached")
+}
+
+func isTemporary(err error) bool {
+	rpcStatus, isGrpcStatus := status.FromError(err)
+	if isGrpcStatus && rpcStatus.Code() == codes.Unavailable {
+		return true
+	}
+
+	return false
 }
