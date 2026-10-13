@@ -152,3 +152,15 @@ func isTemporary(err error) bool {
 
 	return false
 }
+
+func sendChunksToServer(ctx context.Context, fileName string, chunks [][]byte, partitionAddresses *pb.RequestNodeIPsResponse) error {
+	// TODO: Step 1 - Validate len(chunks) == len(partitionAddresses.GetIpAddress())
+	for chunkIndex, payload := range chunks {
+		chunkID := fmt.Sprintf("%s_chunk_%d", fileName, chunkIndex)
+		// TODO: Step 2 - Extract ReplicaSet and guard len(replicaSet.GetNodeIps()) > 0
+		// TODO: Step 3 - Primary is NodeIps[0], replicaTargets are NodeIps[1:]
+		// TODO: Step 4 - Invoke sendChunk(ctx, primaryIP, replicaTargets, chunkID, payload, 3)
+		// TODO: Step 5 - If err != nil, wrap and return early (Line of Sight)
+	}
+	return nil
+}
