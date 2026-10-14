@@ -19,7 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const defaultPartitionSize = 4 * 1024 * 1024
+const defaultPartitionSize = 3 * 1024 * 1024
 
 func main() {
 	chunks, err := partition("G:/My Drive/Eafit/Semester9/CloudComputing/Lab2/Lab2Vid.mp4")
@@ -41,6 +41,14 @@ func main() {
 	for _, replicaIP := range filePartitionAddresses.IpAddress {
 		log.Printf("Main ip: %v, Replica IP: %v", replicaIP.NodeIps[0], replicaIP.NodeIps[1])
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := sendChunksToServer(ctx, "Lab2Vid.mp4", chunks, filePartitionAddresses); err != nil {
+		log.Fatalf("failed to upload partitions: %v", err)
+	}
+	log.Printf("All %d partitions successfully transmitted and stored!", len(chunks))
 
 }
 
@@ -155,20 +163,28 @@ func isTemporary(err error) bool {
 
 func sendChunksToServer(ctx context.Context, fileName string, chunks [][]byte, partitionAddresses *pb.RequestNodeIPsResponse) error {
 	// TODO: Step 1 - Validate len(chunks) == len(partitionAddresses.GetIpAddress())
-	filePartitionAddresses, err := getPartitionAddresses(controlNodeIP, requestPayload)
-	if err != nil {
-		return fmt.Errorf("getting partition addresses: %v", err)
-	}
+	chunkLen := len(chunks)
 
-	if len(chunks) > len(filePartitionAddresses.IpAddress){
+	if chunkLen > len(partitionAddresses.IpAddress) {
 		return fmt.Errorf("The must be less chunks than IPs")
 	}
 	for chunkIndex, payload := range chunks {
 		chunkID := fmt.Sprintf("%s_chunk_%d", fileName, chunkIndex)
 		// TODO: Step 2 - Extract ReplicaSet and guard len(replicaSet.GetNodeIps()) > 0
+		replicaSet := partitionAddresses.IpAddress[chunkIndex].NodeIps
+		if len(replicaSet) <= 0 {
+			return fmt.Errorf("Replica set cant be empty")
+		}
 		// TODO: Step 3 - Primary is NodeIps[0], replicaTargets are NodeIps[1:]
+		primaryNode := replicaSet[0]
+		replicaTargets := replicaSet[1:]
 		// TODO: Step 4 - Invoke sendChunk(ctx, primaryIP, replicaTargets, chunkID, payload, 3)
+		sendChunkResponse, err := sendChunk(ctx, primaryNode, replicaTargets, chunkID, payload, 3)
 		// TODO: Step 5 - If err != nil, wrap and return early (Line of Sight)
+		if err != nil {
+			return fmt.Errorf("dispatching chunk %s to primary %s: %w", chunkID, primaryNode, err)
+		}
+		log.Printf("Chunk %v was successfully created", sendChunkResponse.ChunkId)
 	}
 	return nil
 }

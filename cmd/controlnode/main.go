@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-var availIPs = [4]string{"127.0.0.1:50052", "127.0.0.1:50053", "127.0.0.1:50054", "127.0.0.1:50055"}
+var availIPs = [3]string{"127.0.0.1:50052", "127.0.0.1:50053", "127.0.0.1:50054"}
 
 // controlNodeServer implements the generated pb.FileSavingServer interface
 type controlNodeServer struct {
