@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	pathpkg "path"
 	"sort"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -137,11 +139,67 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// controlNodeServer implements the file-saving service and the node management service.
+// fileRegistry is the in-memory catalog of files and their chunk layout, guarded by an RWMutex.
+type fileRegistry struct {
+	mu    sync.RWMutex
+	files map[string]*cnpb.FileMetadata // keyed by cleaned path
+}
+
+func newFileRegistry() *fileRegistry {
+	return &fileRegistry{files: make(map[string]*cnpb.FileMetadata)}
+}
+
+// create stores metadata for a new path. It returns false if the path already exists.
+func (r *fileRegistry) create(metadata *cnpb.FileMetadata) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.files[metadata.Path]; exists {
+		return false
+	}
+	r.files[metadata.Path] = metadata
+	return true
+}
+
+// get returns a copy of the metadata stored for path.
+func (r *fileRegistry) get(path string) (*cnpb.FileMetadata, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	metadata, ok := r.files[path]
+	if !ok {
+		return nil, false
+	}
+	return proto.Clone(metadata).(*cnpb.FileMetadata), true
+}
+
+// controlNodeServer implements the file-saving, node management and file metadata services.
 type controlNodeServer struct {
 	pb.UnimplementedFileSavingServer
 	cnpb.UnimplementedNodeManagementServiceServer
+	cnpb.UnimplementedFileMetadataServiceServer
 	registry *nodeRegistry
+	files    *fileRegistry
+}
+
+// allocateReplicas picks the replica DataNodes of each chunk from the active
+// nodes, spreading chunks round-robin. It returns one address list per chunk.
+func allocateReplicas(activeIPs []string, chunkNumber int) [][]string {
+	nodeNumber := len(activeIPs)
+	replicas := replicasPerChunk
+	if nodeNumber < replicas {
+		replicas = nodeNumber
+	}
+
+	allocations := make([][]string, 0, chunkNumber)
+	for i := 0; i < chunkNumber; i++ {
+		chunkIPs := make([]string, 0, replicas)
+		for r := 0; r < replicas; r++ {
+			chunkIPs = append(chunkIPs, activeIPs[(i+r)%nodeNumber])
+		}
+		allocations = append(allocations, chunkIPs)
+	}
+	return allocations
 }
 
 func (s *controlNodeServer) RequestNodeIPs(
@@ -156,18 +214,9 @@ func (s *controlNodeServer) RequestNodeIPs(
 		return nil, status.Error(codes.Unavailable, "no active DataNodes available")
 	}
 
-	replicas := replicasPerChunk
-	if nodeNumber < replicas {
-		replicas = nodeNumber
-	}
-
-	chunkNumber := int(req.ChunkNumber)
-	IPAddress := make([]*pb.ReplicaSet, 0, chunkNumber)
-	for i := 0; i < chunkNumber; i++ {
-		chunkIPs := make([]string, 0, replicas)
-		for r := 0; r < replicas; r++ {
-			chunkIPs = append(chunkIPs, activeIPs[(i+r)%nodeNumber])
-		}
+	allocations := allocateReplicas(activeIPs, int(req.ChunkNumber))
+	IPAddress := make([]*pb.ReplicaSet, 0, len(allocations))
+	for _, chunkIPs := range allocations {
 		IPAddress = append(IPAddress, &pb.ReplicaSet{NodeIps: chunkIPs})
 	}
 
@@ -206,6 +255,93 @@ func (s *controlNodeServer) Heartbeat(
 	return &cnpb.HeartbeatResponse{Acknowledged: true}, nil
 }
 
+// cleanFilePath normalizes a client-supplied path and rejects empty or root paths.
+func cleanFilePath(p string) (string, error) {
+	if p == "" {
+		return "", status.Error(codes.InvalidArgument, "path is required")
+	}
+	cleaned := pathpkg.Clean("/" + p)
+	if cleaned == "/" {
+		return "", status.Error(codes.InvalidArgument, "path must name a file")
+	}
+	return cleaned, nil
+}
+
+func (s *controlNodeServer) CreateFileEntry(
+	ctx context.Context,
+	req *cnpb.CreateFileEntryRequest,
+) (*cnpb.CreateFileEntryResponse, error) {
+	filePath, err := cleanFilePath(req.Path)
+	if err != nil {
+		return nil, err
+	}
+	if req.Size < 0 {
+		return nil, status.Error(codes.InvalidArgument, "size must not be negative")
+	}
+	if req.ChunkSize <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "chunk_size must be positive")
+	}
+	chunkSize := int64(req.ChunkSize)
+	expectedChunks := (req.Size + chunkSize - 1) / chunkSize
+	if int64(req.TotalChunks) != expectedChunks {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"total_chunks is %d but a %d-byte file with %d-byte chunks has %d",
+			req.TotalChunks, req.Size, req.ChunkSize, expectedChunks)
+	}
+
+	activeIPs := s.registry.activeAddresses()
+	if len(activeIPs) == 0 {
+		return nil, status.Error(codes.Unavailable, "no active DataNodes available")
+	}
+
+	allocations := allocateReplicas(activeIPs, int(req.TotalChunks))
+	chunks := make([]*cnpb.ChunkAllocation, 0, len(allocations))
+	for i, nodeAddresses := range allocations {
+		size := chunkSize
+		if remaining := req.Size - int64(i)*chunkSize; remaining < size {
+			size = remaining
+		}
+		chunks = append(chunks, &cnpb.ChunkAllocation{
+			ChunkId:       fmt.Sprintf("%s_chunk_%d", filePath, i),
+			ChunkIndex:    int32(i),
+			ChunkSize:     size,
+			NodeAddresses: nodeAddresses,
+		})
+	}
+
+	metadata := &cnpb.FileMetadata{
+		Path:          filePath,
+		Size:          req.Size,
+		TotalChunks:   req.TotalChunks,
+		CreatedAtUnix: time.Now().Unix(),
+		Chunks:        chunks,
+	}
+	if !s.files.create(metadata) {
+		return nil, status.Errorf(codes.AlreadyExists, "file %q already exists", filePath)
+	}
+	log.Printf("Registered file %q (%d bytes, %d chunks)", filePath, req.Size, req.TotalChunks)
+
+	// Reply with a copy so the stored metadata is never shared with the gRPC layer.
+	stored, _ := s.files.get(filePath)
+	return &cnpb.CreateFileEntryResponse{Path: filePath, Chunks: stored.Chunks}, nil
+}
+
+func (s *controlNodeServer) GetFileMetadata(
+	ctx context.Context,
+	req *cnpb.GetFileMetadataRequest,
+) (*cnpb.GetFileMetadataResponse, error) {
+	filePath, err := cleanFilePath(req.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata, ok := s.files.get(filePath)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "file %q not found", filePath)
+	}
+	return &cnpb.GetFileMetadataResponse{Metadata: metadata}, nil
+}
+
 func main() {
 	port := ":50051"
 	controlNodeListener, err := net.Listen("tcp", port)
@@ -220,9 +356,10 @@ func main() {
 	go registry.runMonitor(monitorCtx, monitorInterval)
 
 	controlServer := grpc.NewServer()
-	controlNodeServer := &controlNodeServer{registry: registry}
+	controlNodeServer := &controlNodeServer{registry: registry, files: newFileRegistry()}
 	pb.RegisterFileSavingServer(controlServer, controlNodeServer)
 	cnpb.RegisterNodeManagementServiceServer(controlServer, controlNodeServer)
+	cnpb.RegisterFileMetadataServiceServer(controlServer, controlNodeServer)
 
 	if err := controlServer.Serve(controlNodeListener); err != nil {
 		log.Fatalf("Failed to serve traffic: %v", err)
