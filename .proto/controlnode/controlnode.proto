@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+option go_package = "distributedFileSystem/pkg/proto/controlnode";
+package controlnode;
+
+// Node lifecycle management (DataNode -> ControlNode)
+service NodeManagementService {
+  // Registers a DataNode in the cluster and returns its assigned node ID
+  rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
+  // Periodic liveness signal carrying the node's health payload
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  // Periodic full inventory of the chunks stored in a DataNode
+  rpc BlockReport (BlockReportRequest) returns (BlockReportResponse);
+}
+
+// File metadata and namespace queries (Client -> ControlNode)
+service FileMetadataService {
+  // Retrieves the chunk layout of a file (chunk-to-node mapping)
+  rpc GetFileMetadata (GetFileMetadataRequest) returns (GetFileMetadataResponse);
+  // Registers a new file and allocates the DataNodes for each of its chunks
+  rpc CreateFileEntry (CreateFileEntryRequest) returns (CreateFileEntryResponse);
+  // Lists the entries of a directory
+  rpc ListDirectory (ListDirectoryRequest) returns (ListDirectoryResponse);
+  // Removes a file entry from the namespace
+  rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+}
+
+// ---------- Node lifecycle ----------
+
+message RegisterNodeRequest{
+    string node_address = 1;
+    int64 total_disk_bytes = 2;
+    int64 available_disk_bytes = 3;
+}
+
+message RegisterNodeResponse{
+    string node_id = 1;
+    int32 heartbeat_interval_seconds = 2;
+}
+
+message HeartbeatRequest{
+    string node_id = 1;
+    int64 available_disk_bytes = 2;
+    int32 stored_chunk_count = 3;
+    int64 timestamp_unix = 4;
+}
+
+message HeartbeatResponse{
+    bool acknowledged = 1;
+    // True when the ControlNode does not know this node (e.g. after a restart) and it must register again
+    bool reregister_required = 2;
+}
+
+message BlockReportRequest{
+    string node_id = 1;
+    repeated string chunk_ids = 2;
+    int64 available_disk_bytes = 3;
+}
+
+message BlockReportResponse{
+    bool acknowledged = 1;
+    // Chunks reported by the node that the ControlNode no longer tracks and can be deleted
+    repeated string orphan_chunk_ids = 2;
+}
+
+// ---------- File metadata ----------
+
+// Location of a single chunk and the DataNodes holding its replicas
+message ChunkAllocation{
+    string chunk_id = 1;
+    int32 chunk_index = 2;
+    int64 chunk_size = 3;
+    string check_sum = 4;
+    repeated string node_addresses = 5;
+}
+
+message FileMetadata{
+    string path = 1;
+    int64 size = 2;
+    int32 total_chunks = 3;
+    int64 created_at_unix = 4;
+    repeated ChunkAllocation chunks = 5;
+}
+
+message GetFileMetadataRequest{
+    string path = 1;
+}
+
+message GetFileMetadataResponse{
+    FileMetadata metadata = 1;
+}
+
+message CreateFileEntryRequest{
+    string path = 1;
+    int64 size = 2;
+    int32 total_chunks = 3;
+    int32 chunk_size = 4;
+}
+
+message CreateFileEntryResponse{
+    string path = 1;
+    // One allocation per chunk, ordered by chunk_index
+    repeated ChunkAllocation chunks = 2;
+}
+
+message DirectoryEntry{
+    string name = 1;
+    bool is_directory = 2;
+    int64 size = 3;
+    int64 created_at_unix = 4;
+}
+
+message ListDirectoryRequest{
+    string path = 1;
+}
+
+message ListDirectoryResponse{
+    string path = 1;
+    repeated DirectoryEntry entries = 2;
+}
+
+message DeleteFileRequest{
+    string path = 1;
+}
+
+message DeleteFileResponse{
+    bool deleted = 1;
+}
