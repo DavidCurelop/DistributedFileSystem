@@ -1,0 +1,94 @@
+services:
+  controlnode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: controlnode
+    container_name: controlnode
+    environment:
+      - PORT=50051
+      - DATANODE_IPS=datanode-1:50052,datanode-2:50052,datanode-3:50052
+    ports:
+      - "50051:50051"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  datanode-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: datanode
+    container_name: datanode-1
+    environment:
+      - PORT=50052
+      - DATA_DIR=/data/chunks
+    volumes:
+      - datanode-1-chunks:/data/chunks
+    ports:
+      - "50052:50052"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  datanode-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: datanode
+    container_name: datanode-2
+    environment:
+      - PORT=50052
+      - DATA_DIR=/data/chunks
+    volumes:
+      - datanode-2-chunks:/data/chunks
+    ports:
+      - "50053:50052"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  datanode-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: datanode
+    container_name: datanode-3
+    environment:
+      - PORT=50052
+      - DATA_DIR=/data/chunks
+    volumes:
+      - datanode-3-chunks:/data/chunks
+    ports:
+      - "50054:50052"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: client
+    container_name: client
+    depends_on:
+      - controlnode
+      - datanode-1
+      - datanode-2
+      - datanode-3
+    networks:
+      - dfs-network
+
+networks:
+  dfs-network:
+    driver: bridge
+
+volumes:
+  datanode-1-chunks:
+  datanode-2-chunks:
+  datanode-3-chunks:

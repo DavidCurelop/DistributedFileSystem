@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -22,18 +23,23 @@ import (
 const defaultPartitionSize = 3 * 1024 * 1024
 
 func main() {
-	chunks, err := partition("G:/My Drive/Eafit/Semester9/CloudComputing/Lab2/Lab2Vid.mp4")
+	filePath := flag.String("file", "", "Sets the file to be partitioned and uploaded")
+	controlNodeIP := flag.String("control-node", "localhost:50051", "Target ControlNode address")
+	flag.Parse() // CRITICAL: Must be called before reading *filePath or *controlNodeIP
+	if *filePath == "" {
+		log.Fatalf("A valid file path must be specified via -file")
+	}
+	chunks, err := partition(*filePath)
 	if err != nil {
 		log.Fatalf("Partition failed: %v", err)
 	}
 	log.Printf("Successfully created %d partition(s)!", len(chunks))
 
-	controlNodeIP := "localhost:50051"
 	requestPayload := &pb.RequestNodeIPsRequest{
 		ChunkNumber: int32(len(chunks)),
 		FileName:    "Lab2Vid.mp4",
 	}
-	filePartitionAddresses, err := getPartitionAddresses(controlNodeIP, requestPayload)
+	filePartitionAddresses, err := getPartitionAddresses(*controlNodeIP, requestPayload)
 	if err != nil {
 		log.Fatalf("getting partition addresses: %v", err)
 	}
