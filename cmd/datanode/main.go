@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	pb "distributedFileSystem/pkg/proto/datanode"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -52,7 +54,8 @@ func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkReque
 	}
 
 	computeHash := sha256.Sum256(req.ChunkPayload)
-	if hex.EncodeToString(computeHash[:]) != req.CheckSum {
+	hashString := hex.EncodeToString(computeHash[:])
+	if hashString != req.CheckSum {
 		return nil, status.Errorf(codes.InvalidArgument, "SHA does not match payload")
 	}
 
@@ -63,9 +66,14 @@ func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkReque
 
 	targetPath := filepath.Join(s.storageDirectory, req.ChunkId+".bin")
 	err = os.WriteFile(targetPath, req.ChunkPayload, 0644)
-
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "writing chunk %q to disk: %v", req.ChunkId, err)
+	}
+
+	checksumFilePath := filepath.Join(s.storageDirectory, req.ChunkId+".checksum")
+	err = os.WriteFile(checksumFilePath, []byte(hashString), 0644)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "writing checksum %q to disk: %v", req.ChunkId, err)
 	}
 
 	if len(req.ReplicaTargets) > 0 {
@@ -86,32 +94,70 @@ func (s *dataNodeServer) forwardToNextReplica(
 	req *pb.StoreChunkRequest,
 	remainingTargets []string,
 ) error {
-	// TODO: Step 1 - Establish gRPC client connection to downstreamAddress
 	dataNodeConnection, err := grpc.NewClient(downstreamAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", downstreamAddress, err)
 	}
 
-	// TODO: Step 2 - Defer connection teardown or handle client lifecycle
 	defer dataNodeConnection.Close()
 
 	replicaClient := pb.NewDataNodeServiceClient(dataNodeConnection)
-	// TODO: Step 3 - Construct downstream request with updated remainingTargets
 	replicaStoreRequest := &pb.StoreChunkRequest{
 		ChunkId:        req.ChunkId,
 		ChunkPayload:   req.ChunkPayload,
 		CheckSum:       req.CheckSum,
 		ReplicaTargets: remainingTargets,
 	}
+
 	storeChunkResponse, err := replicaClient.StoreChunk(ctx, replicaStoreRequest)
-	// TODO: Step 4 - Execute StoreChunk RPC with propagated context
+
 	if err != nil {
 		return fmt.Errorf("forwarding chunk %q to %q: %w", req.ChunkId, downstreamAddress, err)
 	}
-	// TODO: Step 5 - Guard against downstream write failure and return error
+
 	if !storeChunkResponse.WriteSuccessful {
 		return fmt.Errorf("downstream replica %q reported write failure for chunk %q", downstreamAddress, req.ChunkId)
 	}
 
 	return nil
+}
+
+// GetChunk retrieves chunk data and verifies at-rest integrity before returning.
+func (s *dataNodeServer) GetChunk(
+	ctx context.Context,
+	req *pb.GetChunkRequest,
+) (*pb.GetChunkResponse, error) {
+	if req.ChunkId == "" {
+		return nil, status.Error(codes.InvalidArgument, "chunk id cant be empty")
+	}
+	
+	targetPath := filepath.Join(s.storageDirectory, req.ChunkId+".bin")
+	checksumFilePath := filepath.Join(s.storageDirectory, req.ChunkId+".checksum")
+
+	chunkPayload, err := os.ReadFile(targetPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, status.Errorf(codes.NotFound, "chunk file does not exist at %q: %v", targetPath, err)
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return nil, status.Errorf(codes.PermissionDenied, "permission denied reading chunk at %q: %v", targetPath, err)
+		}
+		return nil, status.Errorf(codes.Internal, "unexpected error reading chunk at %q: %v", targetPath, err)
+	}
+
+	checksumPayload, err := os.ReadFile(checksumFilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, status.Errorf(codes.NotFound, "checksum file does not exist at %q: %v", checksumFilePath, err)
+		}
+		return nil, status.Errorf(codes.Internal, "unexpected error reading checksum at %q: %v", checksumFilePath, err)
+	}
+
+	computeHash := sha256.Sum256(chunkPayload)
+	hashString := hex.EncodeToString(computeHash[:])
+	if hashString != strings.TrimSpace(string(checksumPayload)) {
+		return nil, status.Errorf(codes.DataLoss, "SHA does not match payload")
+	}
+
+	return &pb.GetChunkResponse{ChunkId: req.ChunkId, ChunkPayload: chunkPayload, CheckSum: hashString}, nil
 }
