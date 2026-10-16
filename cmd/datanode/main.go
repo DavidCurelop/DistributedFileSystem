@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	pb "distributedFileSystem/pkg/proto/datanode"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
@@ -130,7 +132,7 @@ func (s *dataNodeServer) GetChunk(
 	if req.ChunkId == "" {
 		return nil, status.Error(codes.InvalidArgument, "chunk id cant be empty")
 	}
-	
+
 	targetPath := filepath.Join(s.storageDirectory, req.ChunkId+".bin")
 	checksumFilePath := filepath.Join(s.storageDirectory, req.ChunkId+".checksum")
 
@@ -160,4 +162,47 @@ func (s *dataNodeServer) GetChunk(
 	}
 
 	return &pb.GetChunkResponse{ChunkId: req.ChunkId, ChunkPayload: chunkPayload, CheckSum: hashString}, nil
+}
+
+type heartbeatWorker struct {
+	controlNodeAddress string
+	dataNodeAddress    string
+	storageDirectory   string
+	assignedNodeID     string
+	client             cnpb.NodeManagementServiceClient
+}
+
+func newHeartbeatWorker(controlAddr, dataNodeAddr, storageDir string) *heartbeatWorker {
+	// TODO: Step 1 - Initialize the worker struct
+	heartbeatWorker := &heartbeatWorker{
+		controlNodeAddress: controlAddr,
+		dataNodeAddress:    dataNodeAddr,
+		storageDirectory:   storageDir,
+	}
+	return heartbeatWorker
+}
+
+func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
+	// TODO: Step 2 - Establish gRPC connection using grpc.NewClient
+	heartbeatClientconn, err := grpc.NewClient(heartbeatWorker.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("dialing transport connection to %q: %w", heartbeatWorker.controlNodeAddress, err)
+	}
+	heartbeatClient := cnpb.NewNodeManagementServiceClient(heartbeatClientconn)
+	// TODO: Step 3 - Execute initial registration to acquire node ID and heartbeat interval
+
+	// TODO: Step 4 - Launch background loop handling ticker events and context cancellation
+	return nil
+}
+
+func (heartbeatWorker *heartbeatWorker) sendHeartbeat(ctx context.Context) error {
+	// TODO: Step 5 - Create context.WithTimeout for outbound RPC
+	// TODO: Step 6 - Gather disk metrics and invoke w.client.Heartbeat
+	// TODO: Step 7 - If response indicates ReregisterRequired, trigger re-registration flow
+	return nil
+}
+
+func (heartbeatWorker *heartbeatWorker) scanStoredChunks() ([]string, error) {
+	// TODO: Step 8 - Inspect storageDirectory and gather list of active chunk IDs
+	return nil
 }
