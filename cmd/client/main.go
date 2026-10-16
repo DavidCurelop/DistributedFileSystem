@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	pb "distributedFileSystem/pkg/proto/client"
@@ -26,6 +27,8 @@ func main() {
 	filePath := flag.String("file", "", "Sets the file to be partitioned and uploaded")
 	controlNodeIP := flag.String("control-node", "localhost:50051", "Target ControlNode address")
 	flag.Parse() // CRITICAL: Must be called before reading *filePath or *controlNodeIP
+	fileDirArr:= strings.Split(*filePath, "/")
+	fileName := fileDirArr[len(fileDirArr)-1]
 	if *filePath == "" {
 		log.Fatalf("A valid file path must be specified via -file")
 	}
@@ -34,10 +37,9 @@ func main() {
 		log.Fatalf("Partition failed: %v", err)
 	}
 	log.Printf("Successfully created %d partition(s)!", len(chunks))
-
 	requestPayload := &pb.RequestNodeIPsRequest{
 		ChunkNumber: int32(len(chunks)),
-		FileName:    "Lab2Vid.mp4",
+		FileName:    fileName,
 	}
 	filePartitionAddresses, err := getPartitionAddresses(*controlNodeIP, requestPayload)
 	if err != nil {
@@ -51,7 +53,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	if err := sendChunksToServer(ctx, "Lab2Vid.mp4", chunks, filePartitionAddresses); err != nil {
+	if err := sendChunksToServer(ctx, fileName, chunks, filePartitionAddresses); err != nil {
 		log.Fatalf("failed to upload partitions: %v", err)
 	}
 	log.Printf("All %d partitions successfully transmitted and stored!", len(chunks))

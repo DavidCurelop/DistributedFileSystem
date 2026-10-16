@@ -32,6 +32,7 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
+    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-1:50052", "-data-dir=/data/chunks"]
 
   datanode-2:
     build:
@@ -50,6 +51,8 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
+    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-2:50052", "-data-dir=/data/chunks"]
+
 
   datanode-3:
     build:
@@ -68,6 +71,8 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
+    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-3:50052", "-data-dir=/data/chunks"]
+
 
   client:
     build:
