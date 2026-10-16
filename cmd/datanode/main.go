@@ -14,19 +14,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
 func main() {
 	port := flag.String("port", ":50052", "DataNode gRPC listening port")
+	controlAddr := flag.String("ctrlAdr", "localhost", "Address of the control node")
+	nodeAddr := flag.String("nodeAdr", "localhost", "Address of the current data node")
 	dataDir := flag.String("data-dir", "./data/chunks", "Path to chunk storage directory")
 	flag.Parse()
 
+	worker := newHeartbeatWorker(*controlAddr, *nodeAddr, *dataDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		err := worker.Start(ctx)
+		if err != nil {
+			log.Fatalf("starting heartbeat worker %v", err)
+		}
+	}()
 	listener, err := net.Listen("tcp", *port)
 	if err != nil {
 		log.Fatalf("listening on tcp %s: %v", *port, err)
@@ -186,23 +198,94 @@ func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 	// TODO: Step 2 - Establish gRPC connection using grpc.NewClient
 	heartbeatClientconn, err := grpc.NewClient(heartbeatWorker.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("dialing transport connection to %q: %w", heartbeatWorker.controlNodeAddress, err)
+		return fmt.Errorf("dialing transport connection to %q: %v", heartbeatWorker.controlNodeAddress, err)
 	}
-	heartbeatClient := cnpb.NewNodeManagementServiceClient(heartbeatClientconn)
+	heartbeatWorker.client = cnpb.NewNodeManagementServiceClient(heartbeatClientconn)
 	// TODO: Step 3 - Execute initial registration to acquire node ID and heartbeat interval
+	registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to register datanode %v %v", heartbeatWorker.dataNodeAddress, err)
+	}
 
+	heartbeatWorker.assignedNodeID = registerNodeResponse.NodeId
+	heartbeatIntervalSeconds := time.Duration(registerNodeResponse.HeartbeatIntervalSeconds) * time.Second
+
+	heartbeatTicker := time.NewTicker(heartbeatIntervalSeconds)
+	defer heartbeatTicker.Stop()
 	// TODO: Step 4 - Launch background loop handling ticker events and context cancellation
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-heartbeatTicker.C:
+			err = heartbeatWorker.sendHeartbeat(ctx)
+			if err != nil {
+				log.Printf("sending heartbeat from %v %v", heartbeatWorker.assignedNodeID, err)
+			}
+		}
+	}
+}
+
+func (heartbeatWorker *heartbeatWorker) registerNode(ctx context.Context) (*cnpb.RegisterNodeResponse, error) {
+	registerNodeRequest := &cnpb.RegisterNodeRequest{
+		NodeAddress: heartbeatWorker.dataNodeAddress,
+	}
+	registerNodectx, registerNodeCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer registerNodeCancel()
+
+	registerNodeResponse, err := heartbeatWorker.client.RegisterNode(registerNodectx, registerNodeRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register datanode %v %w", heartbeatWorker.dataNodeAddress, err)
+	}
+	return registerNodeResponse, nil
 }
 
 func (heartbeatWorker *heartbeatWorker) sendHeartbeat(ctx context.Context) error {
 	// TODO: Step 5 - Create context.WithTimeout for outbound RPC
+	heartbeatctx, heartbeatctxCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer heartbeatctxCancel()
 	// TODO: Step 6 - Gather disk metrics and invoke w.client.Heartbeat
+	storedChunks, err := heartbeatWorker.scanStoredChunks()
+	if err != nil {
+		return fmt.Errorf("gathering stored chunks for %v, %w", heartbeatWorker.assignedNodeID, err)
+	}
+	heartbeatRequest := &cnpb.HeartbeatRequest{
+		StoredChunkCount: int32(len(storedChunks)),
+		NodeId:           heartbeatWorker.assignedNodeID,
+	}
+
+	heartbeatResponse, err := heartbeatWorker.client.Heartbeat(heartbeatctx, heartbeatRequest)
+	if err != nil {
+		return fmt.Errorf("sending heartbeat from %v %w", heartbeatWorker.assignedNodeID, err)
+	}
 	// TODO: Step 7 - If response indicates ReregisterRequired, trigger re-registration flow
+	if heartbeatResponse.ReregisterRequired {
+		registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
+		if err != nil {
+			return fmt.Errorf("re-registering target %v %w", heartbeatWorker.assignedNodeID, err)
+		}
+		heartbeatWorker.assignedNodeID = registerNodeResponse.NodeId
+	}
 	return nil
 }
 
 func (heartbeatWorker *heartbeatWorker) scanStoredChunks() ([]string, error) {
 	// TODO: Step 8 - Inspect storageDirectory and gather list of active chunk IDs
-	return nil
+	storageDir := heartbeatWorker.storageDirectory
+	directory, err := os.ReadDir(storageDir)
+	var storedChunks []string
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return storedChunks, nil
+		} else {
+			return nil, fmt.Errorf("getting stored chunks from %v %w", storageDir, err)
+		}
+	}
+	for _, file := range directory {
+		if strings.HasSuffix(file.Name(), ".bin") {
+			storedChunks = append(storedChunks, strings.TrimSuffix(file.Name(), ".bin"))
+		}
+	}
+
+	return storedChunks, nil
 }
