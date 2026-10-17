@@ -12,8 +12,11 @@ import (
 
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
+	dnpb "distributedFileSystem/pkg/proto/datanode"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -41,6 +44,38 @@ type nodeRegistry struct {
 	nodes   map[string]*nodeInfo // keyed by node ID
 	nextID  uint64
 	timeout time.Duration
+}
+
+type replicationJob struct {
+	filePath              string
+	chunkID               string
+	sourceDataNodeAddress string
+	targetDataNodeAddress string
+}
+
+func main() {
+	port := ":50051"
+	controlNodeListener, err := net.Listen("tcp", port)
+
+	if err != nil {
+		log.Fatalf("listening on tcp address %q: %v", port, err)
+	}
+
+	registry := newNodeRegistry(heartbeatTimeout)
+	files := newFileRegistry()
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	defer stopMonitor()
+	go registry.runMonitor(monitorCtx, monitorInterval, files)
+
+	controlServer := grpc.NewServer()
+	controlNodeServer := &controlNodeServer{registry: registry, files: files}
+	pb.RegisterFileSavingServer(controlServer, controlNodeServer)
+	cnpb.RegisterNodeManagementServiceServer(controlServer, controlNodeServer)
+	cnpb.RegisterFileMetadataServiceServer(controlServer, controlNodeServer)
+
+	if err := controlServer.Serve(controlNodeListener); err != nil {
+		log.Fatalf("Failed to serve traffic: %v", err)
+	}
 }
 
 func newNodeRegistry(timeout time.Duration) *nodeRegistry {
@@ -123,7 +158,7 @@ func (r *nodeRegistry) activeAddresses() []string {
 
 // runMonitor periodically evicts nodes that missed their heartbeat deadline
 // until ctx is cancelled.
-func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration) {
+func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, files *fileRegistry) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -132,8 +167,21 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			for _, n := range r.evictExpired(now) {
+			evictedNodes := r.evictExpired(now)
+			for _, n := range evictedNodes {
 				log.Printf("DataNode %s (%s) unregistered: no heartbeat for %v", n.id, n.address, r.timeout)
+			}
+
+			if len(evictedNodes) > 0 {
+				replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicasPerChunk)
+
+				for _, job := range replicationJobs {
+					err := executeReplicationJob(ctx, job)
+					if err != nil {
+						continue
+					}
+					files.addReplica(job.filePath, job.chunkID, job.targetDataNodeAddress)
+				}
 			}
 		}
 	}
@@ -143,6 +191,23 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration) {
 type fileRegistry struct {
 	mu    sync.RWMutex
 	files map[string]*cnpb.FileMetadata // keyed by cleaned path
+}
+
+func (r *fileRegistry) addReplica(filePath string, chunkID string, nodeAddress string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// TODO: Step 1 - Lookup fileMetadata in r.files[filePath]
+	fileMetadata, exists := r.files[filePath]
+	// TODO: Step 2 - Find matching chunk where chunk.ChunkId == chunkID
+	if exists {
+		for _, chunk := range fileMetadata.Chunks {
+			if chunk.ChunkId == chunkID {
+				chunk.NodeAddresses = append(chunk.NodeAddresses, nodeAddress)
+			}
+		}
+	}
+	// TODO: Step 3 - Append nodeAddress to chunk.NodeAddresses
 }
 
 func newFileRegistry() *fileRegistry {
@@ -219,6 +284,22 @@ func (s *controlNodeServer) RequestNodeIPs(
 	for _, chunkIPs := range allocations {
 		IPAddress = append(IPAddress, &pb.ReplicaSet{NodeIps: chunkIPs})
 	}
+
+	// Inside RequestNodeIPs after creating allocations:
+	chunks := make([]*cnpb.ChunkAllocation, 0, len(allocations))
+	for chunkIndex, chunkIPs := range allocations {
+		chunks = append(chunks, &cnpb.ChunkAllocation{
+			ChunkId:       fmt.Sprintf("%s_chunk_%d", req.FileName, chunkIndex),
+			ChunkIndex:    int32(chunkIndex),
+			NodeAddresses: chunkIPs,
+		})
+	}
+
+	s.files.create(&cnpb.FileMetadata{
+		Path:        req.FileName,
+		TotalChunks: req.ChunkNumber,
+		Chunks:      chunks,
+	})
 
 	return &pb.RequestNodeIPsResponse{IpAddress: IPAddress}, nil
 }
@@ -342,26 +423,111 @@ func (s *controlNodeServer) GetFileMetadata(
 	return &cnpb.GetFileMetadataResponse{Metadata: metadata}, nil
 }
 
-func main() {
-	port := ":50051"
-	controlNodeListener, err := net.Listen("tcp", port)
+func subtractSlices(source []string, toExclude []string) []string {
+	excludedLookup := make(map[string]bool, len(toExclude))
+	for _, item := range toExclude {
+		excludedLookup[item] = true
+	}
+	var difference []string
+	for _, item := range source {
+		if !excludedLookup[item] {
+			difference = append(difference, item)
+		}
+	}
+	return difference
+}
 
+func intersectSlices(first []string, second []string) []string {
+	lookup := make(map[string]bool, len(second))
+	for _, item := range second {
+		lookup[item] = true
+	}
+	var common []string
+	for _, item := range first {
+		if lookup[item] {
+			common = append(common, item)
+		}
+	}
+	return common
+}
+
+func (registry *fileRegistry) findUnderReplicatedChunks(
+	activeNodes []string,
+	targetReplicationFactor int,
+) []replicationJob {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+
+	var pendingJobs []replicationJob
+
+	for _, fileMetadata := range registry.files {
+		for _, fileChunk := range fileMetadata.Chunks {
+			nodeAddresses := fileChunk.NodeAddresses
+			healthyReplicas := intersectSlices(activeNodes, nodeAddresses)
+
+			if len(healthyReplicas) == 0 || len(healthyReplicas) >= targetReplicationFactor {
+				continue
+			}
+
+			candidateReplicas := subtractSlices(activeNodes, healthyReplicas)
+			if len(candidateReplicas) == 0 {
+				continue
+			}
+
+			chunkReplicationJob := replicationJob{
+				filePath:              fileMetadata.Path,
+				chunkID:               fileChunk.ChunkId,
+				sourceDataNodeAddress: healthyReplicas[0],
+				targetDataNodeAddress: candidateReplicas[0],
+			}
+
+			pendingJobs = append(pendingJobs, chunkReplicationJob)
+		}
+	}
+	return pendingJobs
+}
+
+func executeReplicationJob(ctx context.Context, job replicationJob) error {
+	replicationctx, replicationCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer replicationCancel()
+
+	replicationClientConn, err := grpc.NewClient(job.sourceDataNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("listening on tcp address %q: %v", port, err)
+		return fmt.Errorf("connecting to client %v %w", job.sourceDataNodeAddress, err)
+	}
+	defer replicationClientConn.Close()
+
+	datanodeClient := dnpb.NewDataNodeServiceClient(replicationClientConn)
+
+	getChunkResponse, err := datanodeClient.GetChunk(replicationctx, &dnpb.GetChunkRequest{
+		ChunkId: job.chunkID,
+	})
+	if err != nil {
+		return fmt.Errorf("fetching chunk %q from source %q: %w", job.chunkID, job.sourceDataNodeAddress, err)
 	}
 
-	registry := newNodeRegistry(heartbeatTimeout)
-	monitorCtx, stopMonitor := context.WithCancel(context.Background())
-	defer stopMonitor()
-	go registry.runMonitor(monitorCtx, monitorInterval)
-
-	controlServer := grpc.NewServer()
-	controlNodeServer := &controlNodeServer{registry: registry, files: newFileRegistry()}
-	pb.RegisterFileSavingServer(controlServer, controlNodeServer)
-	cnpb.RegisterNodeManagementServiceServer(controlServer, controlNodeServer)
-	cnpb.RegisterFileMetadataServiceServer(controlServer, controlNodeServer)
-
-	if err := controlServer.Serve(controlNodeListener); err != nil {
-		log.Fatalf("Failed to serve traffic: %v", err)
+	replicationClientConn, err = grpc.NewClient(job.targetDataNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to client %v %w", job.targetDataNodeAddress, err)
 	}
+	defer replicationClientConn.Close()
+
+	datanodeClient = dnpb.NewDataNodeServiceClient(replicationClientConn)
+
+	storeChunkRequest := &dnpb.StoreChunkRequest{
+		ChunkId:        job.chunkID,
+		ChunkPayload:   getChunkResponse.ChunkPayload,
+		CheckSum:       getChunkResponse.CheckSum,
+		ReplicaTargets: nil}
+
+	storeChunkResponse, err := datanodeClient.StoreChunk(replicationctx, storeChunkRequest)
+	if err != nil {
+		return fmt.Errorf("storing chunk %q to %q: %w", job.chunkID, job.targetDataNodeAddress, err)
+	}
+	if !storeChunkResponse.WriteSuccessful {
+		return fmt.Errorf("writing chunk %q to %q: %w", job.chunkID, job.targetDataNodeAddress, err)
+	}
+	// TODO: Step 5 - Return storytelling error on failure or nil on success
+
+	return nil
 }
