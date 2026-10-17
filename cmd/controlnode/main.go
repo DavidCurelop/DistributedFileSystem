@@ -7,6 +7,7 @@ import (
 	"net"
 	pathpkg "path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -187,55 +188,227 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, f
 	}
 }
 
-// fileRegistry is the in-memory catalog of files and their chunk layout, guarded by an RWMutex.
+// namespaceNode is a directory or a file in the in-memory namespace tree.
+type namespaceNode struct {
+	isDir     bool
+	createdAt int64
+	children  map[string]*namespaceNode // directories only
+	metadata  *cnpb.FileMetadata        // files only
+}
+
+// fileRegistry is the in-memory POSIX-like namespace (directories and files with
+// their chunk layout), guarded by an RWMutex. All paths passed to its methods
+// must already be cleaned and absolute (see cleanFilePath and cleanDirPath).
 type fileRegistry struct {
-	mu    sync.RWMutex
-	files map[string]*cnpb.FileMetadata // keyed by cleaned path
+	mu   sync.RWMutex
+	root *namespaceNode
+}
+
+func newFileRegistry() *fileRegistry {
+	return &fileRegistry{root: newDirNode()}
+}
+
+func newDirNode() *namespaceNode {
+	return &namespaceNode{
+		isDir:     true,
+		createdAt: time.Now().Unix(),
+		children:  make(map[string]*namespaceNode),
+	}
+}
+
+// splitPath turns a cleaned absolute path into its components ("/" has none).
+func splitPath(cleaned string) []string {
+	if cleaned == "/" {
+		return nil
+	}
+	return strings.Split(cleaned[1:], "/")
+}
+
+func joinPath(parts []string) string {
+	return "/" + strings.Join(parts, "/")
+}
+
+// walk resolves parts from the root. Callers must hold r.mu.
+func (r *fileRegistry) walk(parts []string) (*namespaceNode, error) {
+	current := r.root
+	for i, name := range parts {
+		if !current.isDir {
+			return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", joinPath(parts[:i]))
+		}
+		next, ok := current.children[name]
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "%q does not exist", joinPath(parts[:i+1]))
+		}
+		current = next
+	}
+	return current, nil
+}
+
+// parentDir resolves the directory that must contain the last component of
+// parts. Callers must hold r.mu.
+func (r *fileRegistry) parentDir(parts []string) (*namespaceNode, error) {
+	parent, err := r.walk(parts[:len(parts)-1])
+	if err != nil {
+		return nil, err
+	}
+	if !parent.isDir {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", joinPath(parts[:len(parts)-1]))
+	}
+	return parent, nil
+}
+
+// insert adds node under the parent of path, which must already exist as a directory.
+func (r *fileRegistry) insert(path string, node *namespaceNode) error {
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return status.Error(codes.AlreadyExists, "\"/\" already exists")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	parent, err := r.parentDir(parts)
+	if err != nil {
+		return err
+	}
+	name := parts[len(parts)-1]
+	if _, exists := parent.children[name]; exists {
+		return status.Errorf(codes.AlreadyExists, "%q already exists", path)
+	}
+	parent.children[name] = node
+	return nil
+}
+
+// createFile stores metadata at metadata.Path. The parent directory must exist.
+func (r *fileRegistry) createFile(metadata *cnpb.FileMetadata) error {
+	return r.insert(metadata.Path, &namespaceNode{metadata: metadata})
+}
+
+// mkdir creates an empty directory. The parent directory must exist.
+func (r *fileRegistry) mkdir(path string) error {
+	return r.insert(path, newDirNode())
+}
+
+// remove detaches the entry at path after checking it with validate.
+func (r *fileRegistry) remove(path string, validate func(*namespaceNode) error) error {
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return status.Error(codes.InvalidArgument, "the root directory cannot be removed")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	parent, err := r.parentDir(parts)
+	if err != nil {
+		return err
+	}
+	name := parts[len(parts)-1]
+	node, ok := parent.children[name]
+	if !ok {
+		return status.Errorf(codes.NotFound, "%q does not exist", path)
+	}
+	if err := validate(node); err != nil {
+		return err
+	}
+	delete(parent.children, name)
+	return nil
+}
+
+// rmdir removes an empty directory.
+func (r *fileRegistry) rmdir(path string) error {
+	return r.remove(path, func(node *namespaceNode) error {
+		if !node.isDir {
+			return status.Errorf(codes.FailedPrecondition, "%q is not a directory", path)
+		}
+		if len(node.children) > 0 {
+			return status.Errorf(codes.FailedPrecondition, "directory %q is not empty", path)
+		}
+		return nil
+	})
+}
+
+// deleteFile removes a file entry from the namespace.
+func (r *fileRegistry) deleteFile(path string) error {
+	return r.remove(path, func(node *namespaceNode) error {
+		if node.isDir {
+			return status.Errorf(codes.FailedPrecondition, "%q is a directory", path)
+		}
+		return nil
+	})
+}
+
+// get returns a copy of the metadata stored for the file at path.
+func (r *fileRegistry) get(path string) (*cnpb.FileMetadata, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	node, err := r.walk(splitPath(path))
+	if err != nil {
+		return nil, err
+	}
+	if node.isDir {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is a directory", path)
+	}
+	return proto.Clone(node.metadata).(*cnpb.FileMetadata), nil
+}
+
+// list returns the entries of the directory at path, sorted by name.
+func (r *fileRegistry) list(path string) ([]*cnpb.DirectoryEntry, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	dir, err := r.walk(splitPath(path))
+	if err != nil {
+		return nil, err
+	}
+	if !dir.isDir {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", path)
+	}
+
+	names := make([]string, 0, len(dir.children))
+	for name := range dir.children {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	entries := make([]*cnpb.DirectoryEntry, 0, len(names))
+	for _, name := range names {
+		child := dir.children[name]
+		entry := &cnpb.DirectoryEntry{Name: name, IsDirectory: child.isDir, CreatedAtUnix: child.createdAt}
+		if !child.isDir {
+			entry.Size = child.metadata.Size
+			entry.CreatedAtUnix = child.metadata.CreatedAtUnix
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// forEachFile visits every file below node. Callers must hold r.mu.
+func forEachFile(node *namespaceNode, visit func(*cnpb.FileMetadata)) {
+	for _, child := range node.children {
+		if child.isDir {
+			forEachFile(child, visit)
+		} else {
+			visit(child.metadata)
+		}
+	}
 }
 
 func (r *fileRegistry) addReplica(filePath string, chunkID string, nodeAddress string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// TODO: Step 1 - Lookup fileMetadata in r.files[filePath]
-	fileMetadata, exists := r.files[filePath]
-	// TODO: Step 2 - Find matching chunk where chunk.ChunkId == chunkID
-	if exists {
-		for _, chunk := range fileMetadata.Chunks {
-			if chunk.ChunkId == chunkID {
-				chunk.NodeAddresses = append(chunk.NodeAddresses, nodeAddress)
-			}
+	node, err := r.walk(splitPath(filePath))
+	if err != nil || node.isDir {
+		return
+	}
+	for _, chunk := range node.metadata.Chunks {
+		if chunk.ChunkId == chunkID {
+			chunk.NodeAddresses = append(chunk.NodeAddresses, nodeAddress)
 		}
 	}
-	// TODO: Step 3 - Append nodeAddress to chunk.NodeAddresses
-}
-
-func newFileRegistry() *fileRegistry {
-	return &fileRegistry{files: make(map[string]*cnpb.FileMetadata)}
-}
-
-// create stores metadata for a new path. It returns false if the path already exists.
-func (r *fileRegistry) create(metadata *cnpb.FileMetadata) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.files[metadata.Path]; exists {
-		return false
-	}
-	r.files[metadata.Path] = metadata
-	return true
-}
-
-// get returns a copy of the metadata stored for path.
-func (r *fileRegistry) get(path string) (*cnpb.FileMetadata, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	metadata, ok := r.files[path]
-	if !ok {
-		return nil, false
-	}
-	return proto.Clone(metadata).(*cnpb.FileMetadata), true
 }
 
 // controlNodeServer implements the file-saving, node management and file metadata services.
@@ -273,6 +446,11 @@ func (s *controlNodeServer) RequestNodeIPs(
 ) (*pb.RequestNodeIPsResponse, error) {
 	log.Printf("Received allocation request for file %q (%d chunks)", req.FileName, req.ChunkNumber)
 
+	filePath, err := cleanFilePath(req.FileName)
+	if err != nil {
+		return nil, err
+	}
+
 	activeIPs := s.registry.activeAddresses()
 	nodeNumber := len(activeIPs)
 	if nodeNumber == 0 {
@@ -295,11 +473,15 @@ func (s *controlNodeServer) RequestNodeIPs(
 		})
 	}
 
-	s.files.create(&cnpb.FileMetadata{
-		Path:        req.FileName,
-		TotalChunks: req.ChunkNumber,
-		Chunks:      chunks,
+	err = s.files.createFile(&cnpb.FileMetadata{
+		Path:          filePath,
+		TotalChunks:   req.ChunkNumber,
+		CreatedAtUnix: time.Now().Unix(),
+		Chunks:        chunks,
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	return &pb.RequestNodeIPsResponse{IpAddress: IPAddress}, nil
 }
@@ -346,6 +528,11 @@ func cleanFilePath(p string) (string, error) {
 		return "", status.Error(codes.InvalidArgument, "path must name a file")
 	}
 	return cleaned, nil
+}
+
+// cleanDirPath normalizes a directory path; an empty path means the root.
+func cleanDirPath(p string) string {
+	return pathpkg.Clean("/" + p)
 }
 
 func (s *controlNodeServer) CreateFileEntry(
@@ -397,14 +584,14 @@ func (s *controlNodeServer) CreateFileEntry(
 		CreatedAtUnix: time.Now().Unix(),
 		Chunks:        chunks,
 	}
-	if !s.files.create(metadata) {
-		return nil, status.Errorf(codes.AlreadyExists, "file %q already exists", filePath)
+	// Reply with a copy so the stored metadata is never shared with the gRPC layer.
+	responseChunks := proto.Clone(metadata).(*cnpb.FileMetadata).Chunks
+	if err := s.files.createFile(metadata); err != nil {
+		return nil, err
 	}
 	log.Printf("Registered file %q (%d bytes, %d chunks)", filePath, req.Size, req.TotalChunks)
 
-	// Reply with a copy so the stored metadata is never shared with the gRPC layer.
-	stored, _ := s.files.get(filePath)
-	return &cnpb.CreateFileEntryResponse{Path: filePath, Chunks: stored.Chunks}, nil
+	return &cnpb.CreateFileEntryResponse{Path: filePath, Chunks: responseChunks}, nil
 }
 
 func (s *controlNodeServer) GetFileMetadata(
@@ -416,11 +603,40 @@ func (s *controlNodeServer) GetFileMetadata(
 		return nil, err
 	}
 
-	metadata, ok := s.files.get(filePath)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "file %q not found", filePath)
+	metadata, err := s.files.get(filePath)
+	if err != nil {
+		return nil, err
 	}
 	return &cnpb.GetFileMetadataResponse{Metadata: metadata}, nil
+}
+
+func (s *controlNodeServer) ListDirectory(
+	ctx context.Context,
+	req *cnpb.ListDirectoryRequest,
+) (*cnpb.ListDirectoryResponse, error) {
+	dirPath := cleanDirPath(req.Path)
+
+	entries, err := s.files.list(dirPath)
+	if err != nil {
+		return nil, err
+	}
+	return &cnpb.ListDirectoryResponse{Path: dirPath, Entries: entries}, nil
+}
+
+func (s *controlNodeServer) DeleteFile(
+	ctx context.Context,
+	req *cnpb.DeleteFileRequest,
+) (*cnpb.DeleteFileResponse, error) {
+	filePath, err := cleanFilePath(req.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.files.deleteFile(filePath); err != nil {
+		return nil, err
+	}
+	log.Printf("Deleted file %q", filePath)
+	return &cnpb.DeleteFileResponse{Deleted: true}, nil
 }
 
 func subtractSlices(source []string, toExclude []string) []string {
@@ -460,7 +676,7 @@ func (registry *fileRegistry) findUnderReplicatedChunks(
 
 	var pendingJobs []replicationJob
 
-	for _, fileMetadata := range registry.files {
+	forEachFile(registry.root, func(fileMetadata *cnpb.FileMetadata) {
 		for _, fileChunk := range fileMetadata.Chunks {
 			nodeAddresses := fileChunk.NodeAddresses
 			healthyReplicas := intersectSlices(activeNodes, nodeAddresses)
@@ -483,7 +699,7 @@ func (registry *fileRegistry) findUnderReplicatedChunks(
 
 			pendingJobs = append(pendingJobs, chunkReplicationJob)
 		}
-	}
+	})
 	return pendingJobs
 }
 
