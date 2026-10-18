@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"distributedFileSystem/pkg/config"
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	datanodePb "distributedFileSystem/pkg/proto/datanode"
@@ -35,11 +36,11 @@ type clientApp struct {
 func main() {
 	ctx := context.Background()
 	// TODO: Step 1 - Define global flags (e.g. -control-node default "localhost:50051")
-	controlNodeAddress := flag.String("ctrlAdd", ":50051", "The address of the primary control node")
+	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "The address of the primary control node, host[:port] (env CONTROL_ADDR)")
 	// TODO: Step 2 - Parse global flags; if remaining args exist, dispatch single command
 	flag.Parse()
 
-	app := &clientApp{controlNodeAddress: *controlNodeAddress}
+	app := &clientApp{controlNodeAddress: config.WithDefaultPort(*controlNodeAddress, "50051")}
 	if len(flag.Args()) > 0 {
 		err := app.dispatchCommand(ctx, flag.Args())
 		if err != nil {
@@ -151,8 +152,24 @@ func (app *clientApp) handlePut(ctx context.Context, args []string) error {
 	return nil
 }
 func (app *clientApp) handleGet(ctx context.Context, args []string) error {
-	// TODO: Step 10 - Query chunk locations from ControlNode
-	// TODO: Step 11 - Fetch chunks sequentially or in parallel from DataNodes with checksum validation
+	if len(args) == 0 {
+		return fmt.Errorf("usage: get <remote_path> [local_path]")
+	}
+	remotePath := args[0]
+
+	localPath := filepath.Base(remotePath)
+	if len(args) >= 2 {
+		localPath = args[1]
+	}
+	// Like cp: downloading into an existing directory keeps the remote file name.
+	if info, err := os.Stat(localPath); err == nil && info.IsDir() {
+		localPath = filepath.Join(localPath, filepath.Base(remotePath))
+	}
+
+	if err := downloadFile(ctx, app.controlNodeAddress, remotePath, localPath); err != nil {
+		return fmt.Errorf("downloading %q: %w", remotePath, err)
+	}
+	fmt.Printf("downloaded %s to %s\n", remotePath, localPath)
 	return nil
 }
 func (app *clientApp) handleList(ctx context.Context, args []string) error {

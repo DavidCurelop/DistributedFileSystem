@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"distributedFileSystem/pkg/config"
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	dnpb "distributedFileSystem/pkg/proto/datanode"
@@ -22,12 +24,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	heartbeatIntervalSeconds = 5
-	heartbeatTimeout         = 3 * heartbeatIntervalSeconds * time.Second
-	monitorInterval          = heartbeatIntervalSeconds * time.Second
-	replicasPerChunk         = 2
-)
+// timeoutMultiplier is how many heartbeat intervals a node may miss before it
+// is unregistered when no explicit timeout is configured.
+const timeoutMultiplier = 3
 
 // nodeInfo is the ControlNode's view of a registered DataNode.
 type nodeInfo struct {
@@ -55,21 +54,50 @@ type replicationJob struct {
 }
 
 func main() {
-	port := ":50051"
+	portFlag := flag.String("port", config.EnvString("PORT", ":50051"), "ControlNode gRPC listening port or address (env PORT)")
+	heartbeatInterval := flag.Int("heartbeat-interval", config.EnvInt("HEARTBEAT_INTERVAL", 5), "Seconds between DataNode heartbeats (env HEARTBEAT_INTERVAL)")
+	heartbeatTimeoutSeconds := flag.Int("heartbeat-timeout", config.EnvInt("HEARTBEAT_TIMEOUT", 0), "Seconds without a heartbeat before a DataNode is unregistered; 0 means 3x the interval (env HEARTBEAT_TIMEOUT)")
+	replicationFactor := flag.Int("replication-factor", config.EnvInt("REPLICATION_FACTOR", 2), "Number of replicas kept for each chunk (env REPLICATION_FACTOR)")
+	flag.Parse()
+
+	if *heartbeatInterval <= 0 {
+		log.Fatalf("heartbeat-interval must be positive, got %d", *heartbeatInterval)
+	}
+	if *replicationFactor <= 0 {
+		log.Fatalf("replication-factor must be positive, got %d", *replicationFactor)
+	}
+	if *heartbeatTimeoutSeconds < 0 {
+		log.Fatalf("heartbeat-timeout must not be negative, got %d", *heartbeatTimeoutSeconds)
+	}
+	if *heartbeatTimeoutSeconds == 0 {
+		*heartbeatTimeoutSeconds = timeoutMultiplier * *heartbeatInterval
+	}
+	if *heartbeatTimeoutSeconds <= *heartbeatInterval {
+		log.Fatalf("heartbeat-timeout (%ds) must be greater than heartbeat-interval (%ds)", *heartbeatTimeoutSeconds, *heartbeatInterval)
+	}
+
+	port := config.ListenAddr(*portFlag)
 	controlNodeListener, err := net.Listen("tcp", port)
 
 	if err != nil {
 		log.Fatalf("listening on tcp address %q: %v", port, err)
 	}
 
-	registry := newNodeRegistry(heartbeatTimeout)
+	registry := newNodeRegistry(time.Duration(*heartbeatTimeoutSeconds) * time.Second)
 	files := newFileRegistry()
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
-	go registry.runMonitor(monitorCtx, monitorInterval, files)
+	go registry.runMonitor(monitorCtx, time.Duration(*heartbeatInterval)*time.Second, *replicationFactor, files)
+	log.Printf("ControlNode listening on %s (heartbeat %ds, timeout %ds, replication factor %d)",
+		port, *heartbeatInterval, *heartbeatTimeoutSeconds, *replicationFactor)
 
 	controlServer := grpc.NewServer()
-	controlNodeServer := &controlNodeServer{registry: registry, files: files}
+	controlNodeServer := &controlNodeServer{
+		registry:                 registry,
+		files:                    files,
+		heartbeatIntervalSeconds: int32(*heartbeatInterval),
+		replicationFactor:        *replicationFactor,
+	}
 	pb.RegisterFileSavingServer(controlServer, controlNodeServer)
 	cnpb.RegisterNodeManagementServiceServer(controlServer, controlNodeServer)
 	cnpb.RegisterFileMetadataServiceServer(controlServer, controlNodeServer)
@@ -159,7 +187,7 @@ func (r *nodeRegistry) activeAddresses() []string {
 
 // runMonitor periodically evicts nodes that missed their heartbeat deadline
 // until ctx is cancelled.
-func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, files *fileRegistry) {
+func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, replicationFactor int, files *fileRegistry) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -174,7 +202,7 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, f
 			}
 
 			if len(evictedNodes) > 0 {
-				replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicasPerChunk)
+				replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicationFactor)
 
 				for _, job := range replicationJobs {
 					err := executeReplicationJob(ctx, job)
@@ -418,13 +446,16 @@ type controlNodeServer struct {
 	cnpb.UnimplementedFileMetadataServiceServer
 	registry *nodeRegistry
 	files    *fileRegistry
+
+	heartbeatIntervalSeconds int32
+	replicationFactor        int
 }
 
 // allocateReplicas picks the replica DataNodes of each chunk from the active
 // nodes, spreading chunks round-robin. It returns one address list per chunk.
-func allocateReplicas(activeIPs []string, chunkNumber int) [][]string {
+func allocateReplicas(activeIPs []string, chunkNumber int, replicationFactor int) [][]string {
 	nodeNumber := len(activeIPs)
-	replicas := replicasPerChunk
+	replicas := replicationFactor
 	if nodeNumber < replicas {
 		replicas = nodeNumber
 	}
@@ -465,7 +496,7 @@ func (s *controlNodeServer) RequestNodeIPs(
 		return nil, status.Error(codes.Unavailable, "no active DataNodes available")
 	}
 
-	allocations := allocateReplicas(activeIPs, int(req.ChunkNumber))
+	allocations := allocateReplicas(activeIPs, int(req.ChunkNumber), s.replicationFactor)
 	IPAddress := make([]*pb.ReplicaSet, 0, len(allocations))
 	for _, chunkIPs := range allocations {
 		IPAddress = append(IPAddress, &pb.ReplicaSet{NodeIps: chunkIPs})
@@ -507,7 +538,7 @@ func (s *controlNodeServer) RegisterNode(
 
 	return &cnpb.RegisterNodeResponse{
 		NodeId:                   id,
-		HeartbeatIntervalSeconds: heartbeatIntervalSeconds,
+		HeartbeatIntervalSeconds: s.heartbeatIntervalSeconds,
 	}, nil
 }
 
@@ -570,7 +601,7 @@ func (s *controlNodeServer) CreateFileEntry(
 		return nil, status.Error(codes.Unavailable, "no active DataNodes available")
 	}
 
-	allocations := allocateReplicas(activeIPs, int(req.TotalChunks))
+	allocations := allocateReplicas(activeIPs, int(req.TotalChunks), s.replicationFactor)
 	chunks := make([]*cnpb.ChunkAllocation, 0, len(allocations))
 	for i, nodeAddresses := range allocations {
 		size := chunkSize

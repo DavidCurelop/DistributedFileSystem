@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"distributedFileSystem/pkg/config"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	pb "distributedFileSystem/pkg/proto/datanode"
 	"encoding/hex"
@@ -23,13 +24,18 @@ import (
 )
 
 func main() {
-	port := flag.String("port", ":50052", "DataNode gRPC listening port")
-	controlAddr := flag.String("ctrlAdr", "localhost", "Address of the control node")
-	nodeAddr := flag.String("nodeAdr", "localhost", "Address of the current data node")
-	dataDir := flag.String("data-dir", "./data/chunks", "Path to chunk storage directory")
+	portFlag := flag.String("port", config.EnvString("PORT", ":50052"), "DataNode gRPC listening port or address (env PORT)")
+	controlAddrFlag := flag.String("ctrlAdr", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Address of the control node, host[:port] (env CONTROL_ADDR)")
+	nodeAddrFlag := flag.String("nodeAdr", config.EnvString("NODE_ADDR", "localhost"), "Address of this data node as seen by the cluster, host[:port] (env NODE_ADDR)")
+	dataDirFlag := flag.String("data-dir", config.EnvString("DATA_DIR", "./data/chunks"), "Path to chunk storage directory (env DATA_DIR)")
 	flag.Parse()
 
-	worker := newHeartbeatWorker(*controlAddr, *nodeAddr, *dataDir)
+	port := config.ListenAddr(*portFlag)
+	controlAddr := config.WithDefaultPort(*controlAddrFlag, "50051")
+	nodeAddr := config.WithDefaultPort(*nodeAddrFlag, config.Port(port))
+	dataDir := dataDirFlag
+
+	worker := newHeartbeatWorker(controlAddr, nodeAddr, *dataDir)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -39,14 +45,14 @@ func main() {
 			log.Fatalf("starting heartbeat worker %v", err)
 		}
 	}()
-	listener, err := net.Listen("tcp", *port)
+	listener, err := net.Listen("tcp", port)
 	if err != nil {
-		log.Fatalf("listening on tcp %s: %v", *port, err)
+		log.Fatalf("listening on tcp %s: %v", port, err)
 	}
 
 	datanodeServer := grpc.NewServer()
 	pb.RegisterDataNodeServiceServer(datanodeServer, &dataNodeServer{storageDirectory: *dataDir})
-	log.Printf("DataNode listening on %s, saving to %s", *port, *dataDir)
+	log.Printf("DataNode listening on %s (advertised as %s), saving to %s", port, nodeAddr, *dataDir)
 
 	if err := datanodeServer.Serve(listener); err != nil {
 		log.Fatalf("Failed to serve traffic: %v", err)
