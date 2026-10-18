@@ -1,6 +1,8 @@
 package main
 
 import (
+	//"bufio"
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,10 +11,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
 	pb "distributedFileSystem/pkg/proto/client"
+	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	datanodePb "distributedFileSystem/pkg/proto/datanode"
 
 	"google.golang.org/grpc"
@@ -23,41 +28,254 @@ import (
 
 const defaultPartitionSize = 3 * 1024 * 1024
 
+type clientApp struct {
+	controlNodeAddress string
+}
+
 func main() {
-	filePath := flag.String("file", "", "Sets the file to be partitioned and uploaded")
-	controlNodeIP := flag.String("control-node", "localhost:50051", "Target ControlNode address")
-	flag.Parse() // CRITICAL: Must be called before reading *filePath or *controlNodeIP
-	fileDirArr:= strings.Split(*filePath, "/")
-	fileName := fileDirArr[len(fileDirArr)-1]
-	if *filePath == "" {
-		log.Fatalf("A valid file path must be specified via -file")
+	ctx := context.Background()
+	// TODO: Step 1 - Define global flags (e.g. -control-node default "localhost:50051")
+	controlNodeAddress := flag.String("ctrlAdd", ":50051", "The address of the primary control node")
+	// TODO: Step 2 - Parse global flags; if remaining args exist, dispatch single command
+	flag.Parse()
+
+	app := &clientApp{controlNodeAddress: *controlNodeAddress}
+	if len(flag.Args()) > 0 {
+		err := app.dispatchCommand(ctx, flag.Args())
+		if err != nil {
+			log.Fatalf("dispatching command %v", err)
+		}
+		return
 	}
-	chunks, err := partition(*filePath)
-	if err != nil {
-		log.Fatalf("Partition failed: %v", err)
+	// TODO: Step 3 - If no command args provided, launch runInteractiveShell(ctx, app)
+	runInteractiveShell(ctx, app)
+}
+
+func (app *clientApp) dispatchCommand(ctx context.Context, commandTokens []string) error {
+	// Guard clause: empty input
+	if len(commandTokens) == 0 {
+		return nil
 	}
-	log.Printf("Successfully created %d partition(s)!", len(chunks))
-	requestPayload := &pb.RequestNodeIPsRequest{
-		ChunkNumber: int32(len(chunks)),
-		FileName:    fileName,
+	commandName := strings.ToLower(commandTokens[0])
+	commandArgs := commandTokens[1:]
+	switch commandName {
+	case "put":
+		return app.handlePut(ctx, commandArgs)
+	case "get":
+		return app.handleGet(ctx, commandArgs)
+	case "ls":
+		return app.handleList(ctx, commandArgs)
+	case "mkdir":
+		return app.handleMkdir(ctx, commandArgs)
+	case "rmdir":
+		return app.handleRmdir(ctx, commandArgs)
+	case "rm":
+		return app.handleRemove(ctx, commandArgs)
+	case "exit", "quit":
+		os.Exit(0)
+		return nil
+	default:
+		return fmt.Errorf("unknown command: %q (supported: put, get, ls, mkdir, rmdir, rm, exit)", commandName)
 	}
-	filePartitionAddresses, err := getPartitionAddresses(*controlNodeIP, requestPayload)
-	if err != nil {
-		log.Fatalf("getting partition addresses: %v", err)
+}
+func runInteractiveShell(ctx context.Context, app *clientApp) {
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		fmt.Print("dfsha> ")
+		input := scanner.Scan()
+		if !input {
+			break
+		}
+		text := strings.Fields(scanner.Text())
+		terminalctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := app.dispatchCommand(terminalctx, text)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		cancel()
+	}
+}
+func (app *clientApp) handlePut(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: put <file_path>")
+	}
+	localSourcePath := args[0]
+	//fileName := filepath.Base(localSourcePath)
+	dfsPath := "/"
+	if len(args) >= 2 {
+		dfsPath = path.Join(args[1], filepath.Base(localSourcePath))
 	}
 
-	for _, replicaIP := range filePartitionAddresses.IpAddress {
-		log.Printf("Main ip: %v, Replica IP: %v", replicaIP.NodeIps[0], replicaIP.NodeIps[1])
+	if len(args) == 1 {
+		dfsPath = path.Join(dfsPath, filepath.Base(localSourcePath))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Measure size of local source file
+	fileInfo, err := os.Stat(localSourcePath)
+	if err != nil {
+		return fmt.Errorf("stating source file %q: %w", localSourcePath, err)
+	}
+	fileSize := fileInfo.Size()
+
+	chunks, err := partition(localSourcePath)
+	if err != nil {
+		return fmt.Errorf("partitioning file %q: %w", localSourcePath, err)
+	}
+
+	conn, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
+	}
+	defer conn.Close()
+
+	client := cnpb.NewFileMetadataServiceClient(conn)
+	createFileResponse, err := client.CreateFileEntry(ctx, &cnpb.CreateFileEntryRequest{
+		Path:        dfsPath,
+		Size:        fileSize,
+		TotalChunks: int32(len(chunks)),
+		ChunkSize:   int32(defaultPartitionSize),
+	})
+
+	if err != nil {
+		return fmt.Errorf("creating file entry %q: %w", dfsPath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-
-	if err := sendChunksToServer(ctx, fileName, chunks, filePartitionAddresses); err != nil {
-		log.Fatalf("failed to upload partitions: %v", err)
+	flattenedFileName := encodeFlatChunkPrefix(dfsPath)
+	if err := sendChunksToServer(ctx, flattenedFileName, chunks, createFileResponse.Chunks); err != nil {
+		return fmt.Errorf("failed to upload partitions: %v", err)
 	}
-	log.Printf("All %d partitions successfully transmitted and stored!", len(chunks))
+	log.Printf("All %d partitions successfully transmitted and stored!\n", len(chunks))
+	return nil
+}
+func (app *clientApp) handleGet(ctx context.Context, args []string) error {
+	// TODO: Step 10 - Query chunk locations from ControlNode
+	// TODO: Step 11 - Fetch chunks sequentially or in parallel from DataNodes with checksum validation
+	return nil
+}
+func (app *clientApp) handleList(ctx context.Context, args []string) error {
+	tagetDirPath := "/"
+	if len(args) > 0 {
+		tagetDirPath = args[0]
+	}
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
+	}
+	defer controlNodeConnection.Close()
 
+	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	listDirectoryResponse, err := client.ListDirectory(ctx, &cnpb.ListDirectoryRequest{Path: tagetDirPath})
+	if err != nil {
+		return fmt.Errorf("listing directory %v: %w", tagetDirPath, err)
+	}
+
+	entries := listDirectoryResponse.Entries
+
+	if len(entries) == 0 {
+		fmt.Fprintf(os.Stdout, "directory '%v' is empty\n", tagetDirPath)
+	}
+
+	for _, entry := range entries {
+		isDir := entry.IsDirectory
+		name := entry.Name
+		size := entry.Size
+		if isDir {
+			fmt.Printf("[Dir] %v, size: %v\n", name, size)
+		} else {
+			fmt.Printf("[File] %v, size: %v\n", name, size)
+		}
+	}
+
+	return nil
+}
+func (app *clientApp) handleRemove(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: rm <file_path>")
+	}
+	filePath := args[0]
+
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
+	}
+	defer controlNodeConnection.Close()
+
+	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	deleteFileResponse, err := client.DeleteFile(ctx, &cnpb.DeleteFileRequest{Path: filePath})
+
+	if err != nil {
+		return fmt.Errorf("deleting file %v: %w", filePath, err)
+	}
+
+	if !deleteFileResponse.Deleted {
+		return fmt.Errorf("file %v was not deleted", filePath)
+
+	}
+
+	fmt.Printf("successfully deleted %v\n", filePath)
+	return nil
+}
+
+func (app *clientApp) handleMkdir(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: mkdir <directory_path>")
+	}
+	dirPath := args[0]
+
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
+	}
+	defer controlNodeConnection.Close()
+
+	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+
+	createDirectoryResponse, err := client.CreateDirectory(ctx, &cnpb.CreateDirectoryRequest{Path: dirPath})
+
+	if err != nil {
+		return fmt.Errorf("creating directory %v: %w", dirPath, err)
+	}
+
+	if !createDirectoryResponse.Created {
+		return fmt.Errorf("directory %v was not created", dirPath)
+
+	}
+
+	fmt.Printf("created directory %s\n", dirPath)
+	return nil
+}
+
+func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: rmdir <directory_path>")
+	}
+
+	dirPath := args[0]
+
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
+	}
+	defer controlNodeConnection.Close()
+
+	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+
+	deleteDirectoryResponse, err := client.DeleteDirectory(ctx, &cnpb.DeleteDirectoryRequest{Path: dirPath})
+
+	if err != nil {
+		return fmt.Errorf("deleting directory %v: %w", dirPath, err)
+	}
+
+	if !deleteDirectoryResponse.Deleted {
+		return fmt.Errorf("directory %v was not deleted", dirPath)
+
+	}
+
+	fmt.Printf("successfully deleted %v\n", dirPath)
+	return nil
 }
 
 func getPartitionAddresses(controlNodeIP string, requestPayload *pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
@@ -100,7 +318,6 @@ func partition(sourceFilePath string) ([][]byte, error) {
 		}
 
 		currentChunk := partitionBuffer[:bytesRead]
-		log.Printf("Partition %d ready: %d bytes", partitionIndex, len(currentChunk))
 		chunks = append(chunks, currentChunk)
 
 		partitionIndex++
@@ -169,30 +386,33 @@ func isTemporary(err error) bool {
 	return false
 }
 
-func sendChunksToServer(ctx context.Context, fileName string, chunks [][]byte, partitionAddresses *pb.RequestNodeIPsResponse) error {
-	// TODO: Step 1 - Validate len(chunks) == len(partitionAddresses.GetIpAddress())
+// Neutral example: Encoding a virtual hierarchy into a flat, safe storage key
+func encodeFlatChunkPrefix(virtualHierarchyPath string) string {
+	// 1. Remove leading slash so we don't start with an underscore
+	trimmed := strings.TrimPrefix(virtualHierarchyPath, "/")
+	// 2. Replace internal slashes with a safe separator
+	return strings.ReplaceAll(trimmed, "/", "_")
+}
+
+func sendChunksToServer(ctx context.Context, fileName string, chunks [][]byte, allocations []*cnpb.ChunkAllocation) error {
 	chunkLen := len(chunks)
 
-	if chunkLen > len(partitionAddresses.IpAddress) {
-		return fmt.Errorf("The must be less chunks than IPs")
-	}
 	for chunkIndex, payload := range chunks {
-		chunkID := fmt.Sprintf("%s_chunk_%d", fileName, chunkIndex)
-		// TODO: Step 2 - Extract ReplicaSet and guard len(replicaSet.GetNodeIps()) > 0
-		replicaSet := partitionAddresses.IpAddress[chunkIndex].NodeIps
-		if len(replicaSet) <= 0 {
-			return fmt.Errorf("Replica set cant be empty")
+		chunkID := allocations[chunkIndex].ChunkId
+		if len(allocations[chunkIndex].NodeAddresses) == 0 {
+			return fmt.Errorf("chunk len must be at least 1")
 		}
-		// TODO: Step 3 - Primary is NodeIps[0], replicaTargets are NodeIps[1:]
-		primaryNode := replicaSet[0]
-		replicaTargets := replicaSet[1:]
-		// TODO: Step 4 - Invoke sendChunk(ctx, primaryIP, replicaTargets, chunkID, payload, 3)
-		sendChunkResponse, err := sendChunk(ctx, primaryNode, replicaTargets, chunkID, payload, 3)
-		// TODO: Step 5 - If err != nil, wrap and return early (Line of Sight)
+
+		primaryNode := allocations[chunkIndex].NodeAddresses[0]
+		replicaTargets := allocations[chunkIndex].NodeAddresses[1:]
+		_, err := sendChunk(ctx, primaryNode, replicaTargets, chunkID, payload, 3)
+
 		if err != nil {
 			return fmt.Errorf("dispatching chunk %s to primary %s: %w", chunkID, primaryNode, err)
 		}
-		log.Printf("Chunk %v was successfully created", sendChunkResponse.ChunkId)
+		percent := (chunkIndex + 1) * 100 / chunkLen
+		fmt.Printf("\rUploading %s: %d/%d chunks (%d%%)", fileName, chunkIndex+1, chunkLen, percent)
 	}
+	fmt.Println()
 	return nil
 }

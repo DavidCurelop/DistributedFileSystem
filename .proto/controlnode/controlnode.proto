@@ -23,6 +23,8 @@ service FileMetadataService {
   rpc ListDirectory (ListDirectoryRequest) returns (ListDirectoryResponse);
   // Removes a file entry from the namespace
   rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+  rpc DeleteDirectory(DeleteDirectoryRequest) returns (DeleteDirectoryResponse);
+  rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
 }
 
 // ---------- Node lifecycle ----------
@@ -125,4 +127,20 @@ message DeleteFileRequest{
 
 message DeleteFileResponse{
     bool deleted = 1;
+}
+
+message DeleteDirectoryRequest{
+    string path = 1;
+}
+
+message DeleteDirectoryResponse{
+    bool deleted = 1;
+}
+
+message CreateDirectoryRequest{
+    string path = 1;
+}
+
+message CreateDirectoryResponse{
+    bool created = 1;
 }

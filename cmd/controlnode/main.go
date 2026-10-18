@@ -440,6 +440,14 @@ func allocateReplicas(activeIPs []string, chunkNumber int) [][]string {
 	return allocations
 }
 
+// Neutral example: Encoding a virtual hierarchy into a flat, safe storage key
+func encodeFlatChunkPrefix(virtualHierarchyPath string) string {
+	// 1. Remove leading slash so we don't start with an underscore
+	trimmed := strings.TrimPrefix(virtualHierarchyPath, "/")
+	// 2. Replace internal slashes with a safe separator
+	return strings.ReplaceAll(trimmed, "/", "_")
+}
+
 func (s *controlNodeServer) RequestNodeIPs(
 	ctx context.Context,
 	req *pb.RequestNodeIPsRequest,
@@ -467,7 +475,7 @@ func (s *controlNodeServer) RequestNodeIPs(
 	chunks := make([]*cnpb.ChunkAllocation, 0, len(allocations))
 	for chunkIndex, chunkIPs := range allocations {
 		chunks = append(chunks, &cnpb.ChunkAllocation{
-			ChunkId:       fmt.Sprintf("%s_chunk_%d", req.FileName, chunkIndex),
+			ChunkId:       fmt.Sprintf("%s_chunk_%d", encodeFlatChunkPrefix(req.FileName), chunkIndex),
 			ChunkIndex:    int32(chunkIndex),
 			NodeAddresses: chunkIPs,
 		})
@@ -570,7 +578,7 @@ func (s *controlNodeServer) CreateFileEntry(
 			size = remaining
 		}
 		chunks = append(chunks, &cnpb.ChunkAllocation{
-			ChunkId:       fmt.Sprintf("%s_chunk_%d", filePath, i),
+			ChunkId:       fmt.Sprintf("%s_chunk_%d", encodeFlatChunkPrefix(filePath), i),
 			ChunkIndex:    int32(i),
 			ChunkSize:     size,
 			NodeAddresses: nodeAddresses,
@@ -637,6 +645,32 @@ func (s *controlNodeServer) DeleteFile(
 	}
 	log.Printf("Deleted file %q", filePath)
 	return &cnpb.DeleteFileResponse{Deleted: true}, nil
+}
+
+func (s *controlNodeServer) DeleteDirectory(
+	ctx context.Context,
+	req *cnpb.DeleteDirectoryRequest,
+) (*cnpb.DeleteDirectoryResponse, error) {
+	dirPath := cleanDirPath(req.Path)
+
+	if err := s.files.rmdir(dirPath); err != nil {
+		return nil, err
+	}
+	log.Printf("Deleted directory %q", dirPath)
+	return &cnpb.DeleteDirectoryResponse{Deleted: true}, nil
+}
+
+func (s *controlNodeServer) CreateDirectory(
+	ctx context.Context,
+	req *cnpb.CreateDirectoryRequest,
+) (*cnpb.CreateDirectoryResponse, error) {
+	dirPath := cleanDirPath(req.Path)
+
+	if err := s.files.mkdir(dirPath); err != nil {
+		return nil, err
+	}
+	log.Printf("created directory %q", dirPath)
+	return &cnpb.CreateDirectoryResponse{Created: true}, nil
 }
 
 func subtractSlices(source []string, toExclude []string) []string {
