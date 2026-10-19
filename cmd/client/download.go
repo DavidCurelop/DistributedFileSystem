@@ -17,7 +17,6 @@ import (
 	datanodePb "distributedFileSystem/pkg/proto/datanode"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -88,7 +87,7 @@ func downloadFile(ctx context.Context, controlNodeIP, remotePath, outputPath str
 }
 
 func getFileMetadata(ctx context.Context, controlNodeIP, remotePath string) (*cnpb.FileMetadata, error) {
-	conn, err := grpc.NewClient(controlNodeIP, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(controlNodeIP, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to server %q: %w", controlNodeIP, err)
 	}
@@ -147,7 +146,7 @@ func fetchChunk(ctx context.Context, chunk *cnpb.ChunkAllocation) ([]byte, error
 }
 
 func fetchChunkFromNode(ctx context.Context, address string, chunk *cnpb.ChunkAllocation) ([]byte, error) {
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(address, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting: %w", err)
 	}

@@ -20,14 +20,18 @@ import (
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	datanodePb "distributedFileSystem/pkg/proto/datanode"
+	"distributedFileSystem/pkg/security"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
 const defaultPartitionSize = 3 * 1024 * 1024
+
+// dialOptions carries the TLS credentials and auth token used by every outgoing connection.
+// It is set once in main before any command runs.
+var dialOptions []grpc.DialOption
 
 type clientApp struct {
 	controlNodeAddress string
@@ -37,8 +41,19 @@ func main() {
 	ctx := context.Background()
 	// TODO: Step 1 - Define global flags (e.g. -control-node default "localhost:50051")
 	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "The address of the primary control node, host[:port] (env CONTROL_ADDR)")
+	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Token sent to the ControlNode and DataNodes (env AUTH_TOKEN)")
+	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify server certificates; empty skips verification (env TLS_CA_FILE)")
 	// TODO: Step 2 - Parse global flags; if remaining args exist, dispatch single command
 	flag.Parse()
+
+	if err := security.ValidateToken(*authToken); err != nil {
+		log.Fatalf("invalid auth token: %v", err)
+	}
+	var err error
+	dialOptions, err = security.ClientDialOptions(*tlsCA, *authToken)
+	if err != nil {
+		log.Fatalf("configuring TLS: %v", err)
+	}
 
 	app := &clientApp{controlNodeAddress: config.WithDefaultPort(*controlNodeAddress, "50051")}
 	if len(flag.Args()) > 0 {
@@ -124,7 +139,7 @@ func (app *clientApp) handlePut(ctx context.Context, args []string) error {
 		return fmt.Errorf("partitioning file %q: %w", localSourcePath, err)
 	}
 
-	conn, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
 	}
@@ -177,7 +192,7 @@ func (app *clientApp) handleList(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		tagetDirPath = args[0]
 	}
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
 	}
@@ -214,7 +229,7 @@ func (app *clientApp) handleRemove(ctx context.Context, args []string) error {
 	}
 	filePath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
 	}
@@ -242,7 +257,7 @@ func (app *clientApp) handleMkdir(ctx context.Context, args []string) error {
 	}
 	dirPath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
 	}
@@ -272,7 +287,7 @@ func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
 
 	dirPath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
 	}
@@ -296,7 +311,7 @@ func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
 }
 
 func getPartitionAddresses(controlNodeIP string, requestPayload *pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
-	controlNodeConnection, err := grpc.NewClient(controlNodeIP, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlNodeConnection, err := grpc.NewClient(controlNodeIP, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to server %q: %w", controlNodeIP, err)
 	}
@@ -350,7 +365,7 @@ func sendChunk(ctx context.Context, dataNodeIP string, replicaTargets []string, 
 	computeHash := sha256.Sum256(payload)
 	computeHashString := hex.EncodeToString(computeHash[:])
 
-	dataNodeConnection, err := grpc.NewClient(dataNodeIP, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dataNodeConnection, err := grpc.NewClient(dataNodeIP, dialOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to server %q: %w", dataNodeIP, err)
 	}

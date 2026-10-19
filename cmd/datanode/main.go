@@ -6,6 +6,7 @@ import (
 	"distributedFileSystem/pkg/config"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	pb "distributedFileSystem/pkg/proto/datanode"
+	"distributedFileSystem/pkg/security"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -19,7 +20,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -28,6 +28,10 @@ func main() {
 	controlAddrFlag := flag.String("ctrlAdr", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Address of the control node, host[:port] (env CONTROL_ADDR)")
 	nodeAddrFlag := flag.String("nodeAdr", config.EnvString("NODE_ADDR", "localhost"), "Address of this data node as seen by the cluster, host[:port] (env NODE_ADDR)")
 	dataDirFlag := flag.String("data-dir", config.EnvString("DATA_DIR", "./data/chunks"), "Path to chunk storage directory (env DATA_DIR)")
+	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Shared token required from every caller and sent to other nodes (env AUTH_TOKEN)")
+	tlsCert := flag.String("tls-cert", config.EnvString("TLS_CERT_FILE", ""), "TLS certificate PEM file; empty generates a self-signed one (env TLS_CERT_FILE)")
+	tlsKey := flag.String("tls-key", config.EnvString("TLS_KEY_FILE", ""), "TLS private key PEM file (env TLS_KEY_FILE)")
+	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify peer certificates; empty skips verification (env TLS_CA_FILE)")
 	flag.Parse()
 
 	port := config.ListenAddr(*portFlag)
@@ -35,7 +39,20 @@ func main() {
 	nodeAddr := config.WithDefaultPort(*nodeAddrFlag, config.Port(port))
 	dataDir := dataDirFlag
 
-	worker := newHeartbeatWorker(controlAddr, nodeAddr, *dataDir)
+	if err := security.ValidateToken(*authToken); err != nil {
+		log.Fatalf("invalid auth token: %v", err)
+	}
+	nodeHost, _, _ := net.SplitHostPort(nodeAddr)
+	serverOptions, err := security.ServerOptions(*tlsCert, *tlsKey, *authToken, nodeHost)
+	if err != nil {
+		log.Fatalf("configuring TLS and authentication: %v", err)
+	}
+	dialOptions, err := security.ClientDialOptions(*tlsCA, *authToken)
+	if err != nil {
+		log.Fatalf("configuring outbound TLS: %v", err)
+	}
+
+	worker := newHeartbeatWorker(controlAddr, nodeAddr, *dataDir, dialOptions)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -50,8 +67,8 @@ func main() {
 		log.Fatalf("listening on tcp %s: %v", port, err)
 	}
 
-	datanodeServer := grpc.NewServer()
-	pb.RegisterDataNodeServiceServer(datanodeServer, &dataNodeServer{storageDirectory: *dataDir})
+	datanodeServer := grpc.NewServer(serverOptions...)
+	pb.RegisterDataNodeServiceServer(datanodeServer, &dataNodeServer{storageDirectory: *dataDir, dialOptions: dialOptions})
 	log.Printf("DataNode listening on %s (advertised as %s), saving to %s", port, nodeAddr, *dataDir)
 
 	if err := datanodeServer.Serve(listener); err != nil {
@@ -62,6 +79,7 @@ func main() {
 type dataNodeServer struct {
 	pb.UnimplementedDataNodeServiceServer
 	storageDirectory string
+	dialOptions      []grpc.DialOption
 }
 
 func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkRequest) (*pb.StoreChunkResponse, error) {
@@ -114,7 +132,7 @@ func (s *dataNodeServer) forwardToNextReplica(
 	req *pb.StoreChunkRequest,
 	remainingTargets []string,
 ) error {
-	dataNodeConnection, err := grpc.NewClient(downstreamAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dataNodeConnection, err := grpc.NewClient(downstreamAddress, s.dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to server %q: %w", downstreamAddress, err)
 	}
@@ -187,22 +205,24 @@ type heartbeatWorker struct {
 	dataNodeAddress    string
 	storageDirectory   string
 	assignedNodeID     string
+	dialOptions        []grpc.DialOption
 	client             cnpb.NodeManagementServiceClient
 }
 
-func newHeartbeatWorker(controlAddr, dataNodeAddr, storageDir string) *heartbeatWorker {
+func newHeartbeatWorker(controlAddr, dataNodeAddr, storageDir string, dialOptions []grpc.DialOption) *heartbeatWorker {
 	// TODO: Step 1 - Initialize the worker struct
 	heartbeatWorker := &heartbeatWorker{
 		controlNodeAddress: controlAddr,
 		dataNodeAddress:    dataNodeAddr,
 		storageDirectory:   storageDir,
+		dialOptions:        dialOptions,
 	}
 	return heartbeatWorker
 }
 
 func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 	// TODO: Step 2 - Establish gRPC connection using grpc.NewClient
-	heartbeatClientconn, err := grpc.NewClient(heartbeatWorker.controlNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	heartbeatClientconn, err := grpc.NewClient(heartbeatWorker.controlNodeAddress, heartbeatWorker.dialOptions...)
 	if err != nil {
 		return fmt.Errorf("dialing transport connection to %q: %v", heartbeatWorker.controlNodeAddress, err)
 	}

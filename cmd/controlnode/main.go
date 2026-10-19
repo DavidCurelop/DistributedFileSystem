@@ -16,10 +16,10 @@ import (
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	dnpb "distributedFileSystem/pkg/proto/datanode"
+	"distributedFileSystem/pkg/security"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -58,7 +58,23 @@ func main() {
 	heartbeatInterval := flag.Int("heartbeat-interval", config.EnvInt("HEARTBEAT_INTERVAL", 5), "Seconds between DataNode heartbeats (env HEARTBEAT_INTERVAL)")
 	heartbeatTimeoutSeconds := flag.Int("heartbeat-timeout", config.EnvInt("HEARTBEAT_TIMEOUT", 0), "Seconds without a heartbeat before a DataNode is unregistered; 0 means 3x the interval (env HEARTBEAT_TIMEOUT)")
 	replicationFactor := flag.Int("replication-factor", config.EnvInt("REPLICATION_FACTOR", 2), "Number of replicas kept for each chunk (env REPLICATION_FACTOR)")
+	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Shared token required from every caller and sent to DataNodes (env AUTH_TOKEN)")
+	tlsCert := flag.String("tls-cert", config.EnvString("TLS_CERT_FILE", ""), "TLS certificate PEM file; empty generates a self-signed one (env TLS_CERT_FILE)")
+	tlsKey := flag.String("tls-key", config.EnvString("TLS_KEY_FILE", ""), "TLS private key PEM file (env TLS_KEY_FILE)")
+	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify DataNode certificates; empty skips verification (env TLS_CA_FILE)")
 	flag.Parse()
+
+	if err := security.ValidateToken(*authToken); err != nil {
+		log.Fatalf("invalid auth token: %v", err)
+	}
+	serverOptions, err := security.ServerOptions(*tlsCert, *tlsKey, *authToken)
+	if err != nil {
+		log.Fatalf("configuring TLS and authentication: %v", err)
+	}
+	dialOptions, err := security.ClientDialOptions(*tlsCA, *authToken)
+	if err != nil {
+		log.Fatalf("configuring outbound TLS: %v", err)
+	}
 
 	if *heartbeatInterval <= 0 {
 		log.Fatalf("heartbeat-interval must be positive, got %d", *heartbeatInterval)
@@ -87,11 +103,11 @@ func main() {
 	files := newFileRegistry()
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
-	go registry.runMonitor(monitorCtx, time.Duration(*heartbeatInterval)*time.Second, *replicationFactor, files)
+	go registry.runMonitor(monitorCtx, time.Duration(*heartbeatInterval)*time.Second, *replicationFactor, dialOptions, files)
 	log.Printf("ControlNode listening on %s (heartbeat %ds, timeout %ds, replication factor %d)",
 		port, *heartbeatInterval, *heartbeatTimeoutSeconds, *replicationFactor)
 
-	controlServer := grpc.NewServer()
+	controlServer := grpc.NewServer(serverOptions...)
 	controlNodeServer := &controlNodeServer{
 		registry:                 registry,
 		files:                    files,
@@ -187,7 +203,7 @@ func (r *nodeRegistry) activeAddresses() []string {
 
 // runMonitor periodically evicts nodes that missed their heartbeat deadline
 // until ctx is cancelled.
-func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, replicationFactor int, files *fileRegistry) {
+func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, replicationFactor int, dialOptions []grpc.DialOption, files *fileRegistry) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -205,7 +221,7 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, r
 				replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicationFactor)
 
 				for _, job := range replicationJobs {
-					err := executeReplicationJob(ctx, job)
+					err := executeReplicationJob(ctx, job, dialOptions)
 					if err != nil {
 						continue
 					}
@@ -768,11 +784,11 @@ func (registry *fileRegistry) findUnderReplicatedChunks(
 	return pendingJobs
 }
 
-func executeReplicationJob(ctx context.Context, job replicationJob) error {
+func executeReplicationJob(ctx context.Context, job replicationJob, dialOptions []grpc.DialOption) error {
 	replicationctx, replicationCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer replicationCancel()
 
-	replicationClientConn, err := grpc.NewClient(job.sourceDataNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	replicationClientConn, err := grpc.NewClient(job.sourceDataNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to client %v %w", job.sourceDataNodeAddress, err)
 	}
@@ -787,7 +803,7 @@ func executeReplicationJob(ctx context.Context, job replicationJob) error {
 		return fmt.Errorf("fetching chunk %q from source %q: %w", job.chunkID, job.sourceDataNodeAddress, err)
 	}
 
-	replicationClientConn, err = grpc.NewClient(job.targetDataNodeAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	replicationClientConn, err = grpc.NewClient(job.targetDataNodeAddress, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connecting to client %v %w", job.targetDataNodeAddress, err)
 	}
