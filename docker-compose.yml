@@ -1,16 +1,60 @@
 services:
-  controlnode:
+  cn1:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         TARGET: controlnode
-    container_name: controlnode
+    container_name: cn1
     environment:
       - PORT=50051
-      - DATANODE_IPS=datanode-1:50052,datanode-2:50052,datanode-3:50052
+      - NODE_ID=cn1
+      - RAFT_PEERS=cn1=cn1:50051,cn2=cn2:50051,cn3=cn3:50051
+      - RAFT_DIR=/data/raft
+    volumes:
+      - cn1-raft:/data/raft
     ports:
       - "50051:50051"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  cn2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: controlnode
+    container_name: cn2
+    environment:
+      - PORT=50051
+      - NODE_ID=cn2
+      - RAFT_PEERS=cn1=cn1:50051,cn2=cn2:50051,cn3=cn3:50051
+      - RAFT_DIR=/data/raft
+    volumes:
+      - cn2-raft:/data/raft
+    ports:
+      - "50055:50051"
+    networks:
+      - dfs-network
+    restart: unless-stopped
+
+  cn3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: controlnode
+    container_name: cn3
+    environment:
+      - PORT=50051
+      - NODE_ID=cn3
+      - RAFT_PEERS=cn1=cn1:50051,cn2=cn2:50051,cn3=cn3:50051
+      - RAFT_DIR=/data/raft
+    volumes:
+      - cn3-raft:/data/raft
+    ports:
+      - "50056:50051"
     networks:
       - dfs-network
     restart: unless-stopped
@@ -32,7 +76,11 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
-    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-1:50052", "-data-dir=/data/chunks"]
+    depends_on:
+      - cn1
+      - cn2
+      - cn3
+    command: ["-ctrlAdr=cn1:50051,cn2:50051,cn3:50051", "-nodeAdr=datanode-1:50052", "-data-dir=/data/chunks"]
 
   datanode-2:
     build:
@@ -51,8 +99,11 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
-    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-2:50052", "-data-dir=/data/chunks"]
-
+    depends_on:
+      - cn1
+      - cn2
+      - cn3
+    command: ["-ctrlAdr=cn1:50051,cn2:50051,cn3:50051", "-nodeAdr=datanode-2:50052", "-data-dir=/data/chunks"]
 
   datanode-3:
     build:
@@ -71,8 +122,11 @@ services:
     networks:
       - dfs-network
     restart: unless-stopped
-    command: ["-ctrlAdr=controlnode:50051", "-nodeAdr=datanode-3:50052", "-data-dir=/data/chunks"]
-
+    depends_on:
+      - cn1
+      - cn2
+      - cn3
+    command: ["-ctrlAdr=cn1:50051,cn2:50051,cn3:50051", "-nodeAdr=datanode-3:50052", "-data-dir=/data/chunks"]
 
   client:
     build:
@@ -81,8 +135,12 @@ services:
       args:
         TARGET: client
     container_name: client
+    environment:
+      - CONTROL_ADDR=cn1:50051,cn2:50051,cn3:50051
     depends_on:
-      - controlnode
+      - cn1
+      - cn2
+      - cn3
       - datanode-1
       - datanode-2
       - datanode-3
@@ -94,6 +152,9 @@ networks:
     driver: bridge
 
 volumes:
+  cn1-raft:
+  cn2-raft:
+  cn3-raft:
   datanode-1-chunks:
   datanode-2-chunks:
-  datanode-3-chunks:
+  datanode-3-chunks:

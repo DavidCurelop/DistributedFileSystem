@@ -23,9 +23,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const registrationRetryInterval = 3 * time.Second
+
 func main() {
 	portFlag := flag.String("port", config.EnvString("PORT", ":50052"), "DataNode gRPC listening port or address (env PORT)")
-	controlAddrFlag := flag.String("ctrlAdr", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Address of the control node, host[:port] (env CONTROL_ADDR)")
+	controlAddrFlag := flag.String("ctrlAdr", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Comma-separated ControlNode addresses, host[:port]; heartbeats are sent to every one (env CONTROL_ADDR)")
 	nodeAddrFlag := flag.String("nodeAdr", config.EnvString("NODE_ADDR", "localhost"), "Address of this data node as seen by the cluster, host[:port] (env NODE_ADDR)")
 	dataDirFlag := flag.String("data-dir", config.EnvString("DATA_DIR", "./data/chunks"), "Path to chunk storage directory (env DATA_DIR)")
 	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Shared token required from every caller and sent to other nodes (env AUTH_TOKEN)")
@@ -35,7 +37,10 @@ func main() {
 	flag.Parse()
 
 	port := config.ListenAddr(*portFlag)
-	controlAddr := config.WithDefaultPort(*controlAddrFlag, "50051")
+	controlNodeAddresses := config.AddressList(*controlAddrFlag, "50051")
+	if len(controlNodeAddresses) == 0 {
+		log.Fatalf("at least one ControlNode address is required")
+	}
 	nodeAddr := config.WithDefaultPort(*nodeAddrFlag, config.Port(port))
 	dataDir := dataDirFlag
 
@@ -52,16 +57,18 @@ func main() {
 		log.Fatalf("configuring outbound TLS: %v", err)
 	}
 
-	worker := newHeartbeatWorker(controlAddr, nodeAddr, *dataDir, dialOptions)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		err := worker.Start(ctx)
-		if err != nil {
-			log.Fatalf("starting heartbeat worker %v", err)
-		}
-	}()
+	for _, controlNodeAddress := range controlNodeAddresses {
+		worker := newHeartbeatWorker(controlNodeAddress, nodeAddr, *dataDir, dialOptions)
+		go func() {
+			err := worker.Start(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Fatalf("heartbeat worker for ControlNode %q stopped: %v", controlNodeAddress, err)
+			}
+		}()
+	}
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatalf("listening on tcp %s: %v", port, err)
@@ -125,7 +132,6 @@ func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkReque
 	return &pb.StoreChunkResponse{ChunkId: req.ChunkId, WriteSuccessful: true}, nil
 }
 
-// Structural Scaffolding for Downstream Forwarding
 func (s *dataNodeServer) forwardToNextReplica(
 	ctx context.Context,
 	downstreamAddress string,
@@ -160,7 +166,6 @@ func (s *dataNodeServer) forwardToNextReplica(
 	return nil
 }
 
-// GetChunk retrieves chunk data and verifies at-rest integrity before returning.
 func (s *dataNodeServer) GetChunk(
 	ctx context.Context,
 	req *pb.GetChunkRequest,
@@ -224,8 +229,9 @@ func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dialing transport connection to %q: %v", heartbeatWorker.controlNodeAddress, err)
 	}
+	defer heartbeatClientconn.Close()
 	heartbeatWorker.client = cnpb.NewNodeManagementServiceClient(heartbeatClientconn)
-	registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
+	registerNodeResponse, err := heartbeatWorker.registerUntilAccepted(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to register datanode %v %v", heartbeatWorker.dataNodeAddress, err)
 	}
@@ -242,8 +248,27 @@ func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 		case <-heartbeatTicker.C:
 			err = heartbeatWorker.sendHeartbeat(ctx)
 			if err != nil {
-				log.Printf("sending heartbeat from %v %v", heartbeatWorker.assignedNodeID, err)
+				log.Printf("sending heartbeat from %v to ControlNode %q: %v", heartbeatWorker.assignedNodeID, heartbeatWorker.controlNodeAddress, err)
 			}
+		}
+	}
+}
+
+func (heartbeatWorker *heartbeatWorker) registerUntilAccepted(ctx context.Context) (*cnpb.RegisterNodeResponse, error) {
+	registrationRetryTicker := time.NewTicker(registrationRetryInterval)
+	defer registrationRetryTicker.Stop()
+
+	for {
+		registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
+		if err == nil {
+			return registerNodeResponse, nil
+		}
+		log.Printf("registering with ControlNode %q (retrying in %v): %v", heartbeatWorker.controlNodeAddress, registrationRetryInterval, err)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-registrationRetryTicker.C:
 		}
 	}
 }
@@ -294,8 +319,6 @@ func (heartbeatWorker *heartbeatWorker) sendHeartbeat(ctx context.Context) error
 	return nil
 }
 
-// diskMetrics returns the total and available bytes of the storage volume.
-// A failure is logged and reported as zero so it never stops the heartbeat.
 func (heartbeatWorker *heartbeatWorker) diskMetrics() (total, available int64) {
 	total, available, err := diskUsage(heartbeatWorker.storageDirectory)
 	if err != nil {

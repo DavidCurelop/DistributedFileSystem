@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"distributedFileSystem/pkg/config"
+	"distributedFileSystem/pkg/failover"
 	pb "distributedFileSystem/pkg/proto/client"
 	cnpb "distributedFileSystem/pkg/proto/controlnode"
 	datanodePb "distributedFileSystem/pkg/proto/datanode"
@@ -34,12 +35,12 @@ const defaultPartitionSize = 3 * 1024 * 1024
 var dialOptions []grpc.DialOption
 
 type clientApp struct {
-	controlNodeAddress string
+	controlNodeConn *grpc.ClientConn
 }
 
 func main() {
 	ctx := context.Background()
-	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "The address of the primary control node, host[:port] (env CONTROL_ADDR)")
+	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Comma-separated ControlNode addresses, host[:port] (env CONTROL_ADDR)")
 	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Token sent to the ControlNode and DataNodes (env AUTH_TOKEN)")
 	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify server certificates; empty skips verification (env TLS_CA_FILE)")
 	flag.Parse()
@@ -53,7 +54,18 @@ func main() {
 		log.Fatalf("configuring TLS: %v", err)
 	}
 
-	app := &clientApp{controlNodeAddress: config.WithDefaultPort(*controlNodeAddress, "50051")}
+	controlNodeAddresses := config.AddressList(*controlNodeAddress, "50051")
+	if len(controlNodeAddresses) == 0 {
+		log.Fatalf("at least one ControlNode address is required")
+	}
+
+	controlNodeConn, err := failover.NewControlNodeClient(controlNodeAddresses, dialOptions...)
+	if err != nil {
+		log.Fatalf("connecting to ControlNodes %v: %v", controlNodeAddresses, err)
+	}
+	defer controlNodeConn.Close()
+
+	app := &clientApp{controlNodeConn: controlNodeConn}
 	if len(flag.Args()) > 0 {
 		err := app.dispatchCommand(ctx, flag.Args())
 		if err != nil {
@@ -136,13 +148,7 @@ func (app *clientApp) handlePut(ctx context.Context, args []string) error {
 		return fmt.Errorf("partitioning file %q: %w", localSourcePath, err)
 	}
 
-	conn, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
-	}
-	defer conn.Close()
-
-	client := cnpb.NewFileMetadataServiceClient(conn)
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 	createFileResponse, err := client.CreateFileEntry(ctx, &cnpb.CreateFileEntryRequest{
 		Path:        dfsPath,
 		Size:        fileSize,
@@ -178,7 +184,7 @@ func (app *clientApp) handleGet(ctx context.Context, args []string) error {
 		localPath = filepath.Join(localPath, filepath.Base(remotePath))
 	}
 
-	if err := downloadFile(ctx, app.controlNodeAddress, remotePath, localPath); err != nil {
+	if err := downloadFile(ctx, app.controlNodeConn, remotePath, localPath); err != nil {
 		return fmt.Errorf("downloading %q: %w", remotePath, err)
 	}
 	fmt.Printf("downloaded %s to %s\n", remotePath, localPath)
@@ -189,13 +195,7 @@ func (app *clientApp) handleList(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		tagetDirPath = args[0]
 	}
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
-	}
-	defer controlNodeConnection.Close()
-
-	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 	listDirectoryResponse, err := client.ListDirectory(ctx, &cnpb.ListDirectoryRequest{Path: tagetDirPath})
 	if err != nil {
 		return fmt.Errorf("listing directory %v: %w", tagetDirPath, err)
@@ -226,13 +226,7 @@ func (app *clientApp) handleRemove(ctx context.Context, args []string) error {
 	}
 	filePath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
-	}
-	defer controlNodeConnection.Close()
-
-	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 	deleteFileResponse, err := client.DeleteFile(ctx, &cnpb.DeleteFileRequest{Path: filePath})
 
 	if err != nil {
@@ -254,13 +248,7 @@ func (app *clientApp) handleMkdir(ctx context.Context, args []string) error {
 	}
 	dirPath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
-	}
-	defer controlNodeConnection.Close()
-
-	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 
 	createDirectoryResponse, err := client.CreateDirectory(ctx, &cnpb.CreateDirectoryRequest{Path: dirPath})
 
@@ -284,13 +272,7 @@ func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
 
 	dirPath := args[0]
 
-	controlNodeConnection, err := grpc.NewClient(app.controlNodeAddress, dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connecting to server %q: %w", app.controlNodeAddress, err)
-	}
-	defer controlNodeConnection.Close()
-
-	client := cnpb.NewFileMetadataServiceClient(controlNodeConnection)
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 
 	deleteDirectoryResponse, err := client.DeleteDirectory(ctx, &cnpb.DeleteDirectoryRequest{Path: dirPath})
 
@@ -307,17 +289,11 @@ func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
 	return nil
 }
 
-func getPartitionAddresses(controlNodeIP string, requestPayload *pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
-	controlNodeConnection, err := grpc.NewClient(controlNodeIP, dialOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to server %q: %w", controlNodeIP, err)
-	}
-	defer controlNodeConnection.Close()
-
+func getPartitionAddresses(controlNodeConn *grpc.ClientConn, requestPayload *pb.RequestNodeIPsRequest) (*pb.RequestNodeIPsResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fileSavingClient := pb.NewFileSavingClient(controlNodeConnection)
+	fileSavingClient := pb.NewFileSavingClient(controlNodeConn)
 
 	response, err := fileSavingClient.RequestNodeIPs(ctx, requestPayload)
 	if err != nil {

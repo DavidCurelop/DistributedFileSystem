@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	pathpkg "path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -62,12 +63,25 @@ func main() {
 	tlsCert := flag.String("tls-cert", config.EnvString("TLS_CERT_FILE", ""), "TLS certificate PEM file; empty generates a self-signed one (env TLS_CERT_FILE)")
 	tlsKey := flag.String("tls-key", config.EnvString("TLS_KEY_FILE", ""), "TLS private key PEM file (env TLS_KEY_FILE)")
 	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify DataNode certificates; empty skips verification (env TLS_CA_FILE)")
+	nodeID := flag.String("node-id", config.EnvString("NODE_ID", "cn1"), "Unique Raft ID of this ControlNode; must appear in -raft-peers (env NODE_ID)")
+	raftPeers := flag.String("raft-peers", config.EnvString("RAFT_PEERS", "cn1=localhost:50051"), "Comma-separated id=host:port gRPC addresses of every ControlNode in the Raft cluster (env RAFT_PEERS)")
+	raftDir := flag.String("raft-dir", config.EnvString("RAFT_DIR", "./data/raft"), "Directory for the Raft log and snapshots; a node-id subdirectory is used (env RAFT_DIR)")
 	flag.Parse()
 
 	if err := security.ValidateToken(*authToken); err != nil {
 		log.Fatalf("invalid auth token: %v", err)
 	}
-	serverOptions, err := security.ServerOptions(*tlsCert, *tlsKey, *authToken)
+	peers, err := parseRaftPeers(*raftPeers)
+	if err != nil {
+		log.Fatalf("invalid raft peers: %v", err)
+	}
+	localPeer, err := findLocalPeer(peers, *nodeID)
+	if err != nil {
+		log.Fatalf("invalid raft configuration: %v", err)
+	}
+	// Peers dial this node by its Raft address, so its host must be in the certificate.
+	localPeerHost, _, _ := net.SplitHostPort(string(localPeer.address))
+	serverOptions, err := security.ServerOptions(*tlsCert, *tlsKey, *authToken, localPeerHost)
 	if err != nil {
 		log.Fatalf("configuring TLS and authentication: %v", err)
 	}
@@ -101,16 +115,28 @@ func main() {
 
 	registry := newNodeRegistry(time.Duration(*heartbeatTimeoutSeconds) * time.Second)
 	files := newFileRegistry()
+	consensus, err := newConsensusNode(consensusSettings{
+		localPeer:     localPeer,
+		peers:         peers,
+		dataDirectory: filepath.Join(*raftDir, *nodeID),
+		dialOptions:   dialOptions,
+	}, &namespaceFSM{files: files})
+	if err != nil {
+		log.Fatalf("starting raft consensus: %v", err)
+	}
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
-	go registry.runMonitor(monitorCtx, time.Duration(*heartbeatInterval)*time.Second, *replicationFactor, dialOptions, files)
-	log.Printf("ControlNode listening on %s (heartbeat %ds, timeout %ds, replication factor %d)",
-		port, *heartbeatInterval, *heartbeatTimeoutSeconds, *replicationFactor)
+	go registry.runMonitor(monitorCtx, time.Duration(*heartbeatInterval)*time.Second, *replicationFactor, dialOptions, files, consensus)
+	log.Printf("ControlNode %s listening on %s (raft address %s, %d raft peers, heartbeat %ds, timeout %ds, replication factor %d)",
+		*nodeID, port, localPeer.address, len(peers), *heartbeatInterval, *heartbeatTimeoutSeconds, *replicationFactor)
 
 	controlServer := grpc.NewServer(serverOptions...)
+	consensus.registerTransport(controlServer)
 	controlNodeServer := &controlNodeServer{
 		registry:                 registry,
 		files:                    files,
+		consensus:                consensus,
+		forwarder:                newLeaderForwarder(dialOptions),
 		heartbeatIntervalSeconds: int32(*heartbeatInterval),
 		replicationFactor:        *replicationFactor,
 	}
@@ -202,11 +228,15 @@ func (r *nodeRegistry) activeAddresses() []string {
 }
 
 // runMonitor periodically evicts nodes that missed their heartbeat deadline
-// until ctx is cancelled.
-func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, replicationFactor int, dialOptions []grpc.DialOption, files *fileRegistry) {
+// until ctx is cancelled. Every ControlNode evicts from its own registry, but
+// only the Raft leader repairs under-replicated chunks.
+func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, replicationFactor int, dialOptions []grpc.DialOption, files *fileRegistry, consensus *consensusNode) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// repairPending survives on followers, so a ControlNode that becomes leader
+	// still repairs evictions it observed before the election.
+	repairPending := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -216,18 +246,36 @@ func (r *nodeRegistry) runMonitor(ctx context.Context, interval time.Duration, r
 			for _, n := range evictedNodes {
 				log.Printf("DataNode %s (%s) unregistered: no heartbeat for %v", n.id, n.address, r.timeout)
 			}
-
 			if len(evictedNodes) > 0 {
-				replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicationFactor)
-
-				for _, job := range replicationJobs {
-					err := executeReplicationJob(ctx, job, dialOptions)
-					if err != nil {
-						continue
-					}
-					files.addReplica(job.filePath, job.chunkID, job.targetDataNodeAddress)
-				}
+				repairPending = true
 			}
+			if !repairPending || !consensus.isLeader() {
+				continue
+			}
+			repairPending = false
+			r.repairUnderReplicatedChunks(ctx, replicationFactor, dialOptions, files, consensus)
+		}
+	}
+}
+
+// repairUnderReplicatedChunks copies chunks that lost replicas and records
+// each new replica through Raft so every ControlNode learns about it.
+func (r *nodeRegistry) repairUnderReplicatedChunks(ctx context.Context, replicationFactor int, dialOptions []grpc.DialOption, files *fileRegistry, consensus *consensusNode) {
+	replicationJobs := files.findUnderReplicatedChunks(r.activeAddresses(), replicationFactor)
+
+	for _, job := range replicationJobs {
+		err := executeReplicationJob(ctx, job, dialOptions)
+		if err != nil {
+			continue
+		}
+		addReplicaCommand := fsmCommand{
+			Type:        commandAddReplica,
+			Path:        job.filePath,
+			ChunkID:     job.chunkID,
+			NodeAddress: job.targetDataNodeAddress,
+		}
+		if err := consensus.apply(ctx, addReplicaCommand); err != nil {
+			log.Printf("recording replica of chunk %q on %q: %v", job.chunkID, job.targetDataNodeAddress, err)
 		}
 	}
 }
@@ -249,13 +297,15 @@ type fileRegistry struct {
 }
 
 func newFileRegistry() *fileRegistry {
-	return &fileRegistry{root: newDirNode()}
+	return &fileRegistry{root: newDirNode(time.Now().Unix())}
 }
 
-func newDirNode() *namespaceNode {
+// newDirNode takes its creation time from the caller so Raft replays build
+// identical directories on every ControlNode.
+func newDirNode(createdAtUnix int64) *namespaceNode {
 	return &namespaceNode{
 		isDir:     true,
-		createdAt: time.Now().Unix(),
+		createdAt: createdAtUnix,
 		children:  make(map[string]*namespaceNode),
 	}
 }
@@ -329,8 +379,8 @@ func (r *fileRegistry) createFile(metadata *cnpb.FileMetadata) error {
 }
 
 // mkdir creates an empty directory. The parent directory must exist.
-func (r *fileRegistry) mkdir(path string) error {
-	return r.insert(path, newDirNode())
+func (r *fileRegistry) mkdir(path string, createdAtUnix int64) error {
+	return r.insert(path, newDirNode(createdAtUnix))
 }
 
 // remove detaches the entry at path after checking it with validate.
@@ -463,6 +513,11 @@ type controlNodeServer struct {
 	registry *nodeRegistry
 	files    *fileRegistry
 
+	// consensus replicates namespace mutations; forwarder routes calls that
+	// reach a follower to the leader.
+	consensus *consensusNode
+	forwarder *leaderForwarder
+
 	heartbeatIntervalSeconds int32
 	replicationFactor        int
 }
@@ -499,6 +554,13 @@ func (s *controlNodeServer) RequestNodeIPs(
 	ctx context.Context,
 	req *pb.RequestNodeIPsRequest,
 ) (*pb.RequestNodeIPsResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return pb.NewFileSavingClient(leaderConnection).RequestNodeIPs(forwardedCtx, req)
+	}
 	log.Printf("Received allocation request for file %q (%d chunks)", req.FileName, req.ChunkNumber)
 
 	filePath, err := cleanFilePath(req.FileName)
@@ -528,13 +590,16 @@ func (s *controlNodeServer) RequestNodeIPs(
 		})
 	}
 
-	err = s.files.createFile(&cnpb.FileMetadata{
+	createFileCommand, err := newCreateFileCommand(&cnpb.FileMetadata{
 		Path:          filePath,
 		TotalChunks:   req.ChunkNumber,
 		CreatedAtUnix: time.Now().Unix(),
 		Chunks:        chunks,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.consensus.apply(ctx, createFileCommand); err != nil {
 		return nil, err
 	}
 
@@ -567,13 +632,11 @@ func (s *controlNodeServer) Heartbeat(
 	}
 
 	if !s.registry.touch(req.NodeId, req.AvailableDiskBytes, req.StoredChunkCount) {
-		// Unknown (expired or ControlNode restarted): ask the node to register again.
 		return &cnpb.HeartbeatResponse{Acknowledged: false, ReregisterRequired: true}, nil
 	}
 	return &cnpb.HeartbeatResponse{Acknowledged: true}, nil
 }
 
-// cleanFilePath normalizes a client-supplied path and rejects empty or root paths.
 func cleanFilePath(p string) (string, error) {
 	if p == "" {
 		return "", status.Error(codes.InvalidArgument, "path is required")
@@ -585,7 +648,6 @@ func cleanFilePath(p string) (string, error) {
 	return cleaned, nil
 }
 
-// cleanDirPath normalizes a directory path; an empty path means the root.
 func cleanDirPath(p string) string {
 	return pathpkg.Clean("/" + p)
 }
@@ -594,6 +656,13 @@ func (s *controlNodeServer) CreateFileEntry(
 	ctx context.Context,
 	req *cnpb.CreateFileEntryRequest,
 ) (*cnpb.CreateFileEntryResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).CreateFileEntry(forwardedCtx, req)
+	}
 	filePath, err := cleanFilePath(req.Path)
 	if err != nil {
 		return nil, err
@@ -639,9 +708,12 @@ func (s *controlNodeServer) CreateFileEntry(
 		CreatedAtUnix: time.Now().Unix(),
 		Chunks:        chunks,
 	}
-	// Reply with a copy so the stored metadata is never shared with the gRPC layer.
 	responseChunks := proto.Clone(metadata).(*cnpb.FileMetadata).Chunks
-	if err := s.files.createFile(metadata); err != nil {
+	createFileCommand, err := newCreateFileCommand(metadata)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.consensus.apply(ctx, createFileCommand); err != nil {
 		return nil, err
 	}
 	log.Printf("Registered file %q (%d bytes, %d chunks)", filePath, req.Size, req.TotalChunks)
@@ -653,6 +725,16 @@ func (s *controlNodeServer) GetFileMetadata(
 	ctx context.Context,
 	req *cnpb.GetFileMetadataRequest,
 ) (*cnpb.GetFileMetadataResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).GetFileMetadata(forwardedCtx, req)
+	}
+	if err := s.consensus.verifyLeader(ctx); err != nil {
+		return nil, err
+	}
 	filePath, err := cleanFilePath(req.Path)
 	if err != nil {
 		return nil, err
@@ -669,6 +751,16 @@ func (s *controlNodeServer) ListDirectory(
 	ctx context.Context,
 	req *cnpb.ListDirectoryRequest,
 ) (*cnpb.ListDirectoryResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).ListDirectory(forwardedCtx, req)
+	}
+	if err := s.consensus.verifyLeader(ctx); err != nil {
+		return nil, err
+	}
 	dirPath := cleanDirPath(req.Path)
 
 	entries, err := s.files.list(dirPath)
@@ -682,12 +774,19 @@ func (s *controlNodeServer) DeleteFile(
 	ctx context.Context,
 	req *cnpb.DeleteFileRequest,
 ) (*cnpb.DeleteFileResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).DeleteFile(forwardedCtx, req)
+	}
 	filePath, err := cleanFilePath(req.Path)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.files.deleteFile(filePath); err != nil {
+	if err := s.consensus.apply(ctx, fsmCommand{Type: commandDeleteFile, Path: filePath}); err != nil {
 		return nil, err
 	}
 	log.Printf("Deleted file %q", filePath)
@@ -698,9 +797,16 @@ func (s *controlNodeServer) DeleteDirectory(
 	ctx context.Context,
 	req *cnpb.DeleteDirectoryRequest,
 ) (*cnpb.DeleteDirectoryResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).DeleteDirectory(forwardedCtx, req)
+	}
 	dirPath := cleanDirPath(req.Path)
 
-	if err := s.files.rmdir(dirPath); err != nil {
+	if err := s.consensus.apply(ctx, fsmCommand{Type: commandDeleteDirectory, Path: dirPath}); err != nil {
 		return nil, err
 	}
 	log.Printf("Deleted directory %q", dirPath)
@@ -711,9 +817,17 @@ func (s *controlNodeServer) CreateDirectory(
 	ctx context.Context,
 	req *cnpb.CreateDirectoryRequest,
 ) (*cnpb.CreateDirectoryResponse, error) {
+	if !s.consensus.isLeader() {
+		leaderConnection, forwardedCtx, err := s.leaderConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cnpb.NewFileMetadataServiceClient(leaderConnection).CreateDirectory(forwardedCtx, req)
+	}
 	dirPath := cleanDirPath(req.Path)
 
-	if err := s.files.mkdir(dirPath); err != nil {
+	createDirectoryCommand := fsmCommand{Type: commandCreateDirectory, Path: dirPath, CreatedAtUnix: time.Now().Unix()}
+	if err := s.consensus.apply(ctx, createDirectoryCommand); err != nil {
 		return nil, err
 	}
 	log.Printf("created directory %q", dirPath)

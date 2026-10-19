@@ -50,6 +50,21 @@ func WithDefaultPort(addr, port string) string {
 	return net.JoinHostPort(addr, port)
 }
 
+// AddressList splits a comma-separated list such as "cn1:50051, cn2" into
+// trimmed addresses, appending port to the entries that have none. Empty
+// entries are skipped.
+func AddressList(rawAddresses, port string) []string {
+	var addresses []string
+	for _, address := range strings.Split(rawAddresses, ",") {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			continue
+		}
+		addresses = append(addresses, WithDefaultPort(address, port))
+	}
+	return addresses
+}
+
 // Port returns the port part of a listen address such as ":50052".
 func Port(listenAddr string) string {
 	_, port, err := net.SplitHostPort(listenAddr)

@@ -29,8 +29,8 @@ const (
 // downloadFile retrieves remotePath from the cluster and writes it to outputPath.
 // The chunks are fetched in order and assembled into a temporary file that
 // replaces outputPath only after every chunk has been verified.
-func downloadFile(ctx context.Context, controlNodeIP, remotePath, outputPath string) error {
-	metadata, err := getFileMetadata(ctx, controlNodeIP, remotePath)
+func downloadFile(ctx context.Context, controlNodeConn *grpc.ClientConn, remotePath, outputPath string) error {
+	metadata, err := getFileMetadata(ctx, controlNodeConn, remotePath)
 	if err != nil {
 		return err
 	}
@@ -86,17 +86,11 @@ func downloadFile(ctx context.Context, controlNodeIP, remotePath, outputPath str
 	return nil
 }
 
-func getFileMetadata(ctx context.Context, controlNodeIP, remotePath string) (*cnpb.FileMetadata, error) {
-	conn, err := grpc.NewClient(controlNodeIP, dialOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to server %q: %w", controlNodeIP, err)
-	}
-	defer conn.Close()
-
+func getFileMetadata(ctx context.Context, controlNodeConn *grpc.ClientConn, remotePath string) (*cnpb.FileMetadata, error) {
 	callCtx, cancel := context.WithTimeout(ctx, metadataTimeout)
 	defer cancel()
 
-	response, err := cnpb.NewFileMetadataServiceClient(conn).GetFileMetadata(callCtx, &cnpb.GetFileMetadataRequest{Path: remotePath})
+	response, err := cnpb.NewFileMetadataServiceClient(controlNodeConn).GetFileMetadata(callCtx, &cnpb.GetFileMetadataRequest{Path: remotePath})
 	if err != nil {
 		return nil, fmt.Errorf("getting metadata of %q: %w", remotePath, err)
 	}
