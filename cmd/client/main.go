@@ -39,11 +39,9 @@ type clientApp struct {
 
 func main() {
 	ctx := context.Background()
-	// TODO: Step 1 - Define global flags (e.g. -control-node default "localhost:50051")
 	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "The address of the primary control node, host[:port] (env CONTROL_ADDR)")
 	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Token sent to the ControlNode and DataNodes (env AUTH_TOKEN)")
 	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify server certificates; empty skips verification (env TLS_CA_FILE)")
-	// TODO: Step 2 - Parse global flags; if remaining args exist, dispatch single command
 	flag.Parse()
 
 	if err := security.ValidateToken(*authToken); err != nil {
@@ -63,7 +61,6 @@ func main() {
 		}
 		return
 	}
-	// TODO: Step 3 - If no command args provided, launch runInteractiveShell(ctx, app)
 	runInteractiveShell(ctx, app)
 }
 

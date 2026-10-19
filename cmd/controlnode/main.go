@@ -822,9 +822,8 @@ func executeReplicationJob(ctx context.Context, job replicationJob, dialOptions 
 		return fmt.Errorf("storing chunk %q to %q: %w", job.chunkID, job.targetDataNodeAddress, err)
 	}
 	if !storeChunkResponse.WriteSuccessful {
-		return fmt.Errorf("writing chunk %q to %q: %w", job.chunkID, job.targetDataNodeAddress, err)
+		return fmt.Errorf("target %q reported write failure for chunk %q", job.targetDataNodeAddress, job.chunkID)
 	}
-	// TODO: Step 5 - Return storytelling error on failure or nil on success
 
 	return nil
 }

@@ -210,7 +210,6 @@ type heartbeatWorker struct {
 }
 
 func newHeartbeatWorker(controlAddr, dataNodeAddr, storageDir string, dialOptions []grpc.DialOption) *heartbeatWorker {
-	// TODO: Step 1 - Initialize the worker struct
 	heartbeatWorker := &heartbeatWorker{
 		controlNodeAddress: controlAddr,
 		dataNodeAddress:    dataNodeAddr,
@@ -221,13 +220,11 @@ func newHeartbeatWorker(controlAddr, dataNodeAddr, storageDir string, dialOption
 }
 
 func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
-	// TODO: Step 2 - Establish gRPC connection using grpc.NewClient
 	heartbeatClientconn, err := grpc.NewClient(heartbeatWorker.controlNodeAddress, heartbeatWorker.dialOptions...)
 	if err != nil {
 		return fmt.Errorf("dialing transport connection to %q: %v", heartbeatWorker.controlNodeAddress, err)
 	}
 	heartbeatWorker.client = cnpb.NewNodeManagementServiceClient(heartbeatClientconn)
-	// TODO: Step 3 - Execute initial registration to acquire node ID and heartbeat interval
 	registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to register datanode %v %v", heartbeatWorker.dataNodeAddress, err)
@@ -238,7 +235,6 @@ func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 
 	heartbeatTicker := time.NewTicker(heartbeatIntervalSeconds)
 	defer heartbeatTicker.Stop()
-	// TODO: Step 4 - Launch background loop handling ticker events and context cancellation
 	for {
 		select {
 		case <-ctx.Done():
@@ -253,8 +249,11 @@ func (heartbeatWorker *heartbeatWorker) Start(ctx context.Context) error {
 }
 
 func (heartbeatWorker *heartbeatWorker) registerNode(ctx context.Context) (*cnpb.RegisterNodeResponse, error) {
+	totalDisk, availableDisk := heartbeatWorker.diskMetrics()
 	registerNodeRequest := &cnpb.RegisterNodeRequest{
-		NodeAddress: heartbeatWorker.dataNodeAddress,
+		NodeAddress:        heartbeatWorker.dataNodeAddress,
+		TotalDiskBytes:     totalDisk,
+		AvailableDiskBytes: availableDisk,
 	}
 	registerNodectx, registerNodeCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer registerNodeCancel()
@@ -267,24 +266,24 @@ func (heartbeatWorker *heartbeatWorker) registerNode(ctx context.Context) (*cnpb
 }
 
 func (heartbeatWorker *heartbeatWorker) sendHeartbeat(ctx context.Context) error {
-	// TODO: Step 5 - Create context.WithTimeout for outbound RPC
 	heartbeatctx, heartbeatctxCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer heartbeatctxCancel()
-	// TODO: Step 6 - Gather disk metrics and invoke w.client.Heartbeat
 	storedChunks, err := heartbeatWorker.scanStoredChunks()
 	if err != nil {
 		return fmt.Errorf("gathering stored chunks for %v, %w", heartbeatWorker.assignedNodeID, err)
 	}
+	_, availableDisk := heartbeatWorker.diskMetrics()
 	heartbeatRequest := &cnpb.HeartbeatRequest{
-		StoredChunkCount: int32(len(storedChunks)),
-		NodeId:           heartbeatWorker.assignedNodeID,
+		NodeId:             heartbeatWorker.assignedNodeID,
+		AvailableDiskBytes: availableDisk,
+		StoredChunkCount:   int32(len(storedChunks)),
+		TimestampUnix:      time.Now().Unix(),
 	}
 
 	heartbeatResponse, err := heartbeatWorker.client.Heartbeat(heartbeatctx, heartbeatRequest)
 	if err != nil {
 		return fmt.Errorf("sending heartbeat from %v %w", heartbeatWorker.assignedNodeID, err)
 	}
-	// TODO: Step 7 - If response indicates ReregisterRequired, trigger re-registration flow
 	if heartbeatResponse.ReregisterRequired {
 		registerNodeResponse, err := heartbeatWorker.registerNode(ctx)
 		if err != nil {
@@ -295,8 +294,18 @@ func (heartbeatWorker *heartbeatWorker) sendHeartbeat(ctx context.Context) error
 	return nil
 }
 
+// diskMetrics returns the total and available bytes of the storage volume.
+// A failure is logged and reported as zero so it never stops the heartbeat.
+func (heartbeatWorker *heartbeatWorker) diskMetrics() (total, available int64) {
+	total, available, err := diskUsage(heartbeatWorker.storageDirectory)
+	if err != nil {
+		log.Printf("gathering disk metrics for %v: %v", heartbeatWorker.storageDirectory, err)
+		return 0, 0
+	}
+	return total, available
+}
+
 func (heartbeatWorker *heartbeatWorker) scanStoredChunks() ([]string, error) {
-	// TODO: Step 8 - Inspect storageDirectory and gather list of active chunk IDs
 	storageDir := heartbeatWorker.storageDirectory
 	directory, err := os.ReadDir(storageDir)
 	var storedChunks []string
