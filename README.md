@@ -1,4 +1,4 @@
-# ST0263 - Sistemas Distribuidos / Proyecto 1: DFSha
+# Sistemas Distribuidos / Proyecto 1: DFSha
 
 Sistema de archivos distribuido basado en bloques (arquitectura Master-Workers con consenso Raft) tolerante a fallos, con cifrado en reposo, control de acceso por usuario y consistencia estricta en el plano de control.
 
