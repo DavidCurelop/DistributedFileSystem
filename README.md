@@ -1,4 +1,4 @@
-# ST0263 - Sistemas Distribuidos / Proyecto 1: DFSha
+# Sistemas Distribuidos / Proyecto 1: DFSha
 
 Sistema de archivos distribuido basado en bloques (arquitectura Master-Workers / tipo HDFS) con tolerancia a fallos, consistencia estricta en el plano de control y redundancia en el plano de datos.
 
