@@ -1,101 +1,157 @@
 # ST0263 - Sistemas Distribuidos / Proyecto 1: DFSha
 
-Sistema de archivos distribuido basado en bloques (arquitectura Master-Workers / tipo HDFS) con tolerancia a fallos, consistencia estricta en el plano de control y redundancia en el plano de datos.
-
-## Decisiones Arquitectónicas Principales
-
-### 1. Consenso y Replicación del Plano de Control (Raft)
-* Se integró `hashicorp/raft` sobre gRPC para coordinar un clúster de tres nodos de control (`cn1`, `cn2`, `cn3`).
-* **Separación de estado duro y blando**: El árbol de directorios y los metadatos de archivos (`fileRegistry`) constituyen el estado duro replicado mediante el log de Raft y persistido en disco usando BoltDB (`raft-boltdb/v2`) y snapshots periódicos. El estado de presencia y métricas de disco de los DataNodes (`nodeRegistry`) se maneja como estado blando local en memoria, alimentado por heartbeats periódicos concurrentes desde cada DataNode.
-* **Reenvío transparente (Follower Forwarding)**: Cualquier ControlNode puede recibir peticiones del cliente. Si un nodo follower recibe una lectura o escritura, la redirige al líder actual vía gRPC. Se incluye la cabecera `x-dfsha-forwarded` para prevenir ciclos de reenvío ante transiciones de liderazgo.
-* **Consistencia en lectura**: Las operaciones de lectura verifican el liderazgo vigente (`VerifyLeader`) antes de retornar resultados para evitar lecturas estancadas ante particiones de red.
-
-### 2. Plano de Datos y Manejo de Bloques
-* **Particionamiento**: Los archivos se dividen en chunks de tamaño fijo (3 MB por defecto).
-* **Replicación en cadena (Pipelined Replication)**: La transferencia de bloques se realiza de forma secuencial de DataNode a DataNode para optimizar el ancho de banda de la red del cliente.
-* **Integridad**: Cada chunk almacena y valida un hash SHA-256 tanto en tránsito como en reposo (`.checksum`).
-* **Autocorrección (Self-Healing)**: El líder monitorea la expiración de DataNodes (umbral de 3 heartbeats perdidos). Al detectar nodos caídos, el líder programa trabajos de replicación entre nodos activos para restablecer el factor de replicación configurado y persiste los nuevos mapeos en Raft.
-
-### 3. Seguridad y Comunicaciones
-* **Transporte**: Comunicaciones internas y externas estandarizadas sobre gRPC HTTP/2.
-* **Cifrado y Autenticación**: Conexiones protegidas mediante TLS (certificados ECDSA P-256 autogenerados o mediante archivos PEM) e interceptores de autenticación por token Bearer compartido (`AUTH_TOKEN`).
-
-### 4. Tolerancia a Fallos en el Cliente
-* El cliente utiliza un canal gRPC configurado con un resolver dinámico multi-endpoint sobre la lista de ControlNodes, utilizando la política `pick_first` y reintentos automáticos ante estados `UNAVAILABLE`, garantizando conmutación transparente durante elecciones de líder.
+Sistema de archivos distribuido basado en bloques (arquitectura Master-Workers con consenso Raft) tolerante a fallos, con cifrado en reposo, control de acceso por usuario y consistencia estricta en el plano de control.
 
 ---
 
-## Estructura del Proyecto
+## 1. Arquitectura del Sistema
 
-* `cmd/controlnode/`: Punto de entrada del ControlNode, implementación de la FSM de Raft (`fsm.go`), configuración de consenso (`consensus.go`) y proxy de reenvío (`forwarding.go`).
-* `cmd/datanode/`: Servidor de bloques de datos y trabajador de heartbeats concurrentes a múltiples ControlNodes.
-* `cmd/client/`: CLI para administración y transferencia de archivos (`put`, `get`, `ls`, `mkdir`, `rm`, `rmdir`).
-* `pkg/failover/`: Mecanismo de resolución y balanceo multi-nodo para el cliente gRPC.
-* `pkg/security/`: Generación de certificados TLS e interceptores de autenticación.
-* `pkg/config/`: Utilidades de lectura de variables de entorno y normalización de direcciones.
-* `docker-compose.yml`: Definición de infraestructura local con 3 ControlNodes, 3 DataNodes y volúmenes persistentes.
+El sistema implementa una arquitectura desacoplada entre el plano de control y el plano de datos:
+
+* **ControlNode (Plano de Control)**: Coordina el espacio de nombres jerárquico POSIX (`fileRegistry`), mapeo de bloques a nodos y registro de DataNodes (`nodeRegistry`). Utiliza una máquina de estados replicada mediante el protocolo de consenso Raft (`hashicorp/raft`) sobre gRPC y almacenamiento BoltDB. Implementa failover automático de líder, redirección transparente desde seguidores (`x-dfsha-forwarded`) y monitor de auto-recuperación (self-healing).
+* **DataNode (Plano de Datos)**: Almacena físicamente los bloques de datos. Aplica cifrado en reposo AES-256-GCM, verifica sumas de verificación SHA-256, reporta estado mediante heartbeats periódicos a los ControlNodes y participa en replicación encadenada.
+* **Cliente CLI**: Interfaz interactiva de usuario y línea de comandos para transferir archivos y gestionar directorios. Mantiene estado de directorio de trabajo local (`cwd`), resuelve rutas relativas/absolutas y transmite credenciales de usuario y autenticación mediante metadatos gRPC.
 
 ---
 
-## Ejecución del Sistema
+## 2. Protocolos de Comunicación gRPC
+
+La interacción entre nodos se distribuye en cinco protocolos estandarizados sobre HTTP/2 y Protocol Buffers:
+
+1. **Cliente <-> ControlNode**: Gestión de metadatos de archivos y directorios (`FileMetadataService`: `CreateFileEntry`, `GetFileMetadata`, `ListDirectory`, `CreateDirectory`, `DeleteFile`, `DeleteDirectory`) y asignación de ubicaciones de bloques (`FileSaving`: `RequestNodeIPs`).
+2. **Cliente <-> DataNode**: Transmisión y almacenamiento directo de bloques de datos (`DataNodeService`: `StoreChunk`, `GetChunk`). El cliente no almacena datos en el ControlNode.
+3. **DataNode <-> DataNode**: Replicación encadenada (*pipelined replication*) de bloques. El DataNode primario recibe el chunk y la lista de réplicas restantes, propagando el payload al siguiente nodo antes de confirmar la escritura.
+4. **ControlNode <-> DataNode**: Registro inicial (`RegisterNode`) y heartbeats periódicos concurrentes (`Heartbeat`). El ControlNode líder monitorea expiración de nodos y emite transferencias de self-healing cuando el factor de replicación disminuye.
+5. **ControlNode <-> ControlNode**: Consenso distribuido Raft (`RaftService`: `AppendEntries`, `RequestVote`, `InstallSnapshot`) y proxy de solicitudes hacia el líder vigente con propagación de contexto y usuario.
+
+---
+
+## 3. Cumplimiento de Requerimientos del Sistema
+
+* **RF1 (Interfaz y CLI)**:
+  * Directorio de trabajo local con comandos `pwd` y `cd <ruta>`. Soporta rutas relativas (`.`, `..`, subdirectorios) y absolutas (`/`).
+  * Validación previa de existencia de directorios remotos antes de modificar `cwd`.
+  * Prompt interactivo dinámico con formato `dfsha:<cwd>> `.
+  * Comandos soportados: `put`, `get`, `ls`, `cd`, `pwd`, `mkdir`, `rm`, `rmdir`, `exit`.
+* **RF2 (Manejo de Archivos y Particionamiento)**:
+  * División de archivos en chunks de 3 MB (`defaultPartitionSize`).
+  * Integridad garantizada mediante hash SHA-256 por cada bloque.
+  * Replicación pipelined en DataNodes con factor de replicación configurable.
+* **RF3 (Tolerancia a Fallos y Alta Disponibilidad)**:
+  * Clúster multi-ControlNode (3 nodos) con quórum estricto y elección automática ante desconexión del líder.
+  * Replicación de estado del árbol de archivos persistido en log de Raft y snapshots.
+  * Failover en cliente con reintentos transparentes ante código `UNAVAILABLE`.
+  * Auto-recuperación (self-healing) en segundo plano ante pérdida de DataNodes.
+
+---
+
+## 4. Arquitectura de Seguridad
+
+* **Transporte Seguro (TLS 1.2+)**: Canales gRPC asegurados mediante TLS utilizando claves criptográficas ECDSA P-256. Soporta certificados provistos por archivo CA o autogeneración en tiempo de arranque.
+* **Autenticación por Token**: Interceptores unarios y de streaming que exigen `authorization: Bearer <token>` o cabecera `x-auth-token`.
+* **Cifrado en Reposo (AES-256-GCM)**: Implementado en `pkg/security/crypto.go`. La clave simétrica de 256 bits se deriva de la frase de paso usando `sha256.Sum256`. Cada bloque genera un nonce criptográfico de 12 bytes mediante `crypto/rand` y almacena `nonce || ciphertext` en los archivos `.bin` del DataNode. Los hashes SHA-256 del texto plano se guardan en `.checksum` para verificar integridad tras descifrado.
+* **Control de Acceso y Propiedad (ACL)**:
+  * Identidad de usuario transmitida en cabecera gRPC `x-dfs-user` mediante `NewUserTokenCredentials`.
+  * Cada archivo y directorio registra su propietario (`owner`), persistido en la FSM de Raft.
+  * El directorio raíz `/` es público y permite creación de recursos a cualquier usuario autenticado.
+  * Todo usuario tiene acceso total a sus propios archivos y directorios.
+  * Usuarios sin autorización reciben `codes.PermissionDenied`.
+  * El usuario `admin` posee privilegios de superusuario (acceso irrestricto de lectura y escritura).
+
+---
+
+## 5. Instrucciones de Compilación y Ejecución
+
+### Requisitos
+* Go 1.22+
+* Docker y Docker Compose
+
+### Compilación y Pruebas Unitarias
+Compilar todos los paquetes:
+```bash
+go build ./...
+```
+
+Ejecutar suite completa de pruebas unitarias (incluyendo pruebas de cifrado y ACL):
+```bash
+go test -v ./...
+```
 
 ### Despliegue con Docker Compose
-
-Iniciar todo el clúster (3 ControlNodes, 3 DataNodes y contenedor de cliente):
-
+Iniciar el clúster con 3 ControlNodes (`cn1`, `cn2`, `cn3`) y 3 DataNodes (`datanode-1`, `datanode-2`, `datanode-3`):
 ```bash
 docker compose up -d --build
 ```
 
-Visualizar estado de los contenedores:
-
+Verificar estado de los contenedores:
 ```bash
 docker compose ps
 ```
 
-### Uso del Cliente CLI
+---
 
-El contenedor del cliente incluye un archivo de prueba pregenerado en `/test.bin`.
+## 6. Guía de Uso del Cliente CLI
 
-Subir un archivo a la raíz (`/`):
+El cliente puede ejecutarse de forma interactiva o por comandos individuales:
+
+### Modo Interactivo
 ```bash
-docker compose run --rm client put /test.bin
+docker compose run --rm client
+```
+Ejemplo de sesión:
+```text
+dfsha:/> mkdir docs
+dfsha:/> cd docs
+dfsha:/docs> pwd
+/docs
+dfsha:/docs> put /test.bin
+dfsha:/docs> ls
+dfsha:/docs> cd ..
+dfsha:/> ls docs
+dfsha:/> exit
 ```
 
-Listar contenido de la raíz:
+### Operaciones Directas y Aislamiento Multiusuario
+El flag `-user` (o variable `DFS_USER`) define la identidad del cliente:
+
+1. Subir archivo como usuario `alice`:
 ```bash
-docker compose run --rm client ls /
+docker compose run --rm client -user=alice mkdir /privado_alice
+docker compose run --rm client -user=alice put /test.bin /privado_alice
 ```
 
-Crear un directorio y subir un archivo dentro de él (el segundo argumento de `put` es el directorio destino, el cual debe existir previamente):
+2. Intentar acceder como usuario `bob` (bloqueado por control de acceso):
 ```bash
-docker compose run --rm client mkdir /archivos
-docker compose run --rm client put /test.bin /archivos
-docker compose run --rm client ls /archivos
+docker compose run --rm client -user=bob ls /privado_alice
+# Error: listing directory /privado_alice: rpc error: code = PermissionDenied desc = permission denied: owned by "alice"
 ```
 
-Descargar un archivo reconstruyendo sus bloques:
+3. Acceder con permisos de superusuario `admin`:
 ```bash
-docker compose run --rm client get /archivos/test.bin /tmp/test_recuperado.bin
+docker compose run --rm client -user=admin ls /privado_alice
 ```
 
-Borrar archivos y directorios:
+4. Descargar archivo:
 ```bash
-docker compose run --rm client rm /archivos/test.bin
-docker compose run --rm client rmdir /archivos
+docker compose run --rm client -user=alice get /privado_alice/test.bin /tmp/test_recuperado.bin
 ```
 
-### Pruebas de Failover del Líder
+5. Eliminar recursos:
+```bash
+docker compose run --rm client -user=alice rm /privado_alice/test.bin
+docker compose run --rm client -user=alice rmdir /privado_alice
+```
 
-Para validar la tolerancia a fallos y la persistencia de estado:
+---
+
+## 7. Validación de Tolerancia a Fallos (Failover del Líder)
 
 1. Detener el contenedor del líder actual (ej. `cn1`):
-   ```bash
-   docker compose stop cn1
-   ```
-2. Ejecutar operaciones desde el cliente sin reiniciar dependencias:
-   ```bash
-   docker compose run --rm --no-deps client ls /
-   ```
-3. Los nodos restantes convocarán elecciones, seleccionarán un nuevo líder y responderán las solicitudes conservando el estado previo.
-
+```bash
+docker compose stop cn1
+```
+2. Ejecutar operaciones desde el cliente sin reiniciar servicios:
+```bash
+docker compose run --rm --no-deps client ls /
+```
+3. Los ControlNodes restantes reconfiguran el quórum, eligen un nuevo líder y atienden solicitudes de lectura y escritura manteniendo la consistencia de los datos.

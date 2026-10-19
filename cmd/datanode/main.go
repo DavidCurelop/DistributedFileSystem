@@ -34,7 +34,13 @@ func main() {
 	tlsCert := flag.String("tls-cert", config.EnvString("TLS_CERT_FILE", ""), "TLS certificate PEM file; empty generates a self-signed one (env TLS_CERT_FILE)")
 	tlsKey := flag.String("tls-key", config.EnvString("TLS_KEY_FILE", ""), "TLS private key PEM file (env TLS_KEY_FILE)")
 	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify peer certificates; empty skips verification (env TLS_CA_FILE)")
+	encryptionKeyFlag := flag.String("encryption-key", config.EnvString("ENCRYPTION_KEY", ""), "Passphrase for AES-256-GCM chunk encryption at rest (env ENCRYPTION_KEY)")
 	flag.Parse()
+
+	encryptionKey := *encryptionKeyFlag
+	if encryptionKey == "" {
+		encryptionKey = *authToken
+	}
 
 	port := config.ListenAddr(*portFlag)
 	controlNodeAddresses := config.AddressList(*controlAddrFlag, "50051")
@@ -75,7 +81,11 @@ func main() {
 	}
 
 	datanodeServer := grpc.NewServer(serverOptions...)
-	pb.RegisterDataNodeServiceServer(datanodeServer, &dataNodeServer{storageDirectory: *dataDir, dialOptions: dialOptions})
+	pb.RegisterDataNodeServiceServer(datanodeServer, &dataNodeServer{
+		storageDirectory: *dataDir,
+		dialOptions:      dialOptions,
+		encryptionKey:    encryptionKey,
+	})
 	log.Printf("DataNode listening on %s (advertised as %s), saving to %s", port, nodeAddr, *dataDir)
 
 	if err := datanodeServer.Serve(listener); err != nil {
@@ -87,6 +97,7 @@ type dataNodeServer struct {
 	pb.UnimplementedDataNodeServiceServer
 	storageDirectory string
 	dialOptions      []grpc.DialOption
+	encryptionKey    string
 }
 
 func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkRequest) (*pb.StoreChunkResponse, error) {
@@ -104,13 +115,18 @@ func (s *dataNodeServer) StoreChunk(ctx context.Context, req *pb.StoreChunkReque
 		return nil, status.Errorf(codes.InvalidArgument, "SHA does not match payload")
 	}
 
-	err := os.MkdirAll(s.storageDirectory, 0755)
+	encryptedPayload, err := security.EncryptChunk(req.ChunkPayload, s.encryptionKey)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encrypting chunk %q: %v", req.ChunkId, err)
+	}
+
+	err = os.MkdirAll(s.storageDirectory, 0755)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "Could not create directory %v, %v", s.storageDirectory, err)
 	}
 
 	targetPath := filepath.Join(s.storageDirectory, req.ChunkId+".bin")
-	err = os.WriteFile(targetPath, req.ChunkPayload, 0644)
+	err = os.WriteFile(targetPath, encryptedPayload, 0644)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "writing chunk %q to disk: %v", req.ChunkId, err)
 	}
@@ -177,7 +193,7 @@ func (s *dataNodeServer) GetChunk(
 	targetPath := filepath.Join(s.storageDirectory, req.ChunkId+".bin")
 	checksumFilePath := filepath.Join(s.storageDirectory, req.ChunkId+".checksum")
 
-	chunkPayload, err := os.ReadFile(targetPath)
+	encryptedPayload, err := os.ReadFile(targetPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, status.Errorf(codes.NotFound, "chunk file does not exist at %q: %v", targetPath, err)
@@ -194,6 +210,11 @@ func (s *dataNodeServer) GetChunk(
 			return nil, status.Errorf(codes.NotFound, "checksum file does not exist at %q: %v", checksumFilePath, err)
 		}
 		return nil, status.Errorf(codes.Internal, "unexpected error reading checksum at %q: %v", checksumFilePath, err)
+	}
+
+	chunkPayload, err := security.DecryptChunk(encryptedPayload, s.encryptionKey)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "decrypting chunk %q: %v", req.ChunkId, err)
 	}
 
 	computeHash := sha256.Sum256(chunkPayload)

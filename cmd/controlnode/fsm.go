@@ -27,18 +27,19 @@ const (
 type fsmCommand struct {
 	Type          fsmCommandType `json:"type"`
 	Path          string         `json:"path"`
+	Owner         string         `json:"owner,omitempty"`
 	CreatedAtUnix int64          `json:"created_at_unix,omitempty"`
 	FileMetadata  []byte         `json:"file_metadata,omitempty"` 
 	ChunkID       string         `json:"chunk_id,omitempty"`
 	NodeAddress   string         `json:"node_address,omitempty"`
 }
 
-func newCreateFileCommand(metadata *cnpb.FileMetadata) (fsmCommand, error) {
+func newCreateFileCommand(metadata *cnpb.FileMetadata, owner string) (fsmCommand, error) {
 	encodedMetadata, err := proto.Marshal(metadata)
 	if err != nil {
 		return fsmCommand{}, status.Errorf(codes.Internal, "encoding metadata of %q: %v", metadata.Path, err)
 	}
-	return fsmCommand{Type: commandCreateFile, Path: metadata.Path, FileMetadata: encodedMetadata}, nil
+	return fsmCommand{Type: commandCreateFile, Path: metadata.Path, Owner: owner, FileMetadata: encodedMetadata}, nil
 }
 
 type namespaceFSM struct {
@@ -59,9 +60,9 @@ func (fsm *namespaceFSM) Apply(logEntry *raft.Log) any {
 		if err := proto.Unmarshal(command.FileMetadata, metadata); err != nil {
 			return status.Errorf(codes.Internal, "decoding metadata of %q in raft log entry %d: %v", command.Path, logEntry.Index, err)
 		}
-		return fsm.files.createFile(metadata)
+		return fsm.files.createFile(metadata, command.Owner)
 	case commandCreateDirectory:
-		return fsm.files.mkdir(command.Path, command.CreatedAtUnix)
+		return fsm.files.mkdir(command.Path, command.CreatedAtUnix, command.Owner)
 	case commandDeleteFile:
 		return fsm.files.deleteFile(command.Path)
 	case commandDeleteDirectory:
@@ -98,6 +99,7 @@ func (fsm *namespaceFSM) Restore(snapshotReader io.ReadCloser) error {
 type namespaceSnapshotEntry struct {
 	Path          string `json:"path"`
 	IsDirectory   bool   `json:"is_directory"`
+	Owner         string `json:"owner,omitempty"`
 	CreatedAtUnix int64  `json:"created_at_unix,omitempty"`
 	FileMetadata  []byte `json:"file_metadata,omitempty"` 
 }
@@ -147,11 +149,11 @@ func appendSnapshotEntries(entries *[]namespaceSnapshotEntry, dir *namespaceNode
 			if err != nil {
 				return fmt.Errorf("encoding metadata of %q: %w", childPath, err)
 			}
-			*entries = append(*entries, namespaceSnapshotEntry{Path: childPath, FileMetadata: encodedMetadata})
+			*entries = append(*entries, namespaceSnapshotEntry{Path: childPath, Owner: child.owner, FileMetadata: encodedMetadata})
 			continue
 		}
 
-		*entries = append(*entries, namespaceSnapshotEntry{Path: childPath, IsDirectory: true, CreatedAtUnix: child.createdAt})
+		*entries = append(*entries, namespaceSnapshotEntry{Path: childPath, IsDirectory: true, Owner: child.owner, CreatedAtUnix: child.createdAt})
 		if err := appendSnapshotEntries(entries, child, childParts); err != nil {
 			return err
 		}
@@ -160,7 +162,7 @@ func appendSnapshotEntries(entries *[]namespaceSnapshotEntry, dir *namespaceNode
 }
 
 func (r *fileRegistry) importSnapshot(snapshot *namespaceSnapshot) error {
-	restored := &fileRegistry{root: newDirNode(snapshot.RootCreatedAtUnix)}
+	restored := &fileRegistry{root: newDirNode(snapshot.RootCreatedAtUnix, "")}
 	for _, entry := range snapshot.Entries {
 		restoredNode, err := entry.namespaceNode()
 		if err != nil {
@@ -179,11 +181,11 @@ func (r *fileRegistry) importSnapshot(snapshot *namespaceSnapshot) error {
 
 func (entry namespaceSnapshotEntry) namespaceNode() (*namespaceNode, error) {
 	if entry.IsDirectory {
-		return newDirNode(entry.CreatedAtUnix), nil
+		return newDirNode(entry.CreatedAtUnix, entry.Owner), nil
 	}
 	metadata := &cnpb.FileMetadata{}
 	if err := proto.Unmarshal(entry.FileMetadata, metadata); err != nil {
 		return nil, fmt.Errorf("decoding metadata of %q: %w", entry.Path, err)
 	}
-	return &namespaceNode{metadata: metadata}, nil
+	return &namespaceNode{metadata: metadata, owner: entry.Owner}, nil
 }

@@ -280,32 +280,28 @@ func (r *nodeRegistry) repairUnderReplicatedChunks(ctx context.Context, replicat
 	}
 }
 
-// namespaceNode is a directory or a file in the in-memory namespace tree.
 type namespaceNode struct {
 	isDir     bool
 	createdAt int64
-	children  map[string]*namespaceNode // directories only
-	metadata  *cnpb.FileMetadata        // files only
+	owner     string
+	children  map[string]*namespaceNode
+	metadata  *cnpb.FileMetadata
 }
 
-// fileRegistry is the in-memory POSIX-like namespace (directories and files with
-// their chunk layout), guarded by an RWMutex. All paths passed to its methods
-// must already be cleaned and absolute (see cleanFilePath and cleanDirPath).
 type fileRegistry struct {
 	mu   sync.RWMutex
 	root *namespaceNode
 }
 
 func newFileRegistry() *fileRegistry {
-	return &fileRegistry{root: newDirNode(time.Now().Unix())}
+	return &fileRegistry{root: newDirNode(time.Now().Unix(), "")}
 }
 
-// newDirNode takes its creation time from the caller so Raft replays build
-// identical directories on every ControlNode.
-func newDirNode(createdAtUnix int64) *namespaceNode {
+func newDirNode(createdAtUnix int64, owner string) *namespaceNode {
 	return &namespaceNode{
 		isDir:     true,
 		createdAt: createdAtUnix,
+		owner:     owner,
 		children:  make(map[string]*namespaceNode),
 	}
 }
@@ -373,17 +369,59 @@ func (r *fileRegistry) insert(path string, node *namespaceNode) error {
 	return nil
 }
 
-// createFile stores metadata at metadata.Path. The parent directory must exist.
-func (r *fileRegistry) createFile(metadata *cnpb.FileMetadata) error {
-	return r.insert(metadata.Path, &namespaceNode{metadata: metadata})
+const adminUser = "admin"
+
+func checkAccess(node *namespaceNode, caller string) error {
+	if caller == adminUser || node.owner == "" || node.owner == caller {
+		return nil
+	}
+	return status.Errorf(codes.PermissionDenied, "permission denied: owned by %q", node.owner)
 }
 
-// mkdir creates an empty directory. The parent directory must exist.
-func (r *fileRegistry) mkdir(path string, createdAtUnix int64) error {
-	return r.insert(path, newDirNode(createdAtUnix))
+func (r *fileRegistry) checkParentAccess(path string, caller string) error {
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return status.Error(codes.AlreadyExists, "\"/\" already exists")
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	parent, err := r.parentDir(parts)
+	if err != nil {
+		return err
+	}
+	name := parts[len(parts)-1]
+	if _, exists := parent.children[name]; exists {
+		return status.Errorf(codes.AlreadyExists, "%q already exists", path)
+	}
+	return checkAccess(parent, caller)
 }
 
-// remove detaches the entry at path after checking it with validate.
+func (r *fileRegistry) checkNodeAccess(path string, caller string) error {
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		return status.Error(codes.InvalidArgument, "the root directory cannot be modified")
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	node, err := r.walk(parts)
+	if err != nil {
+		return err
+	}
+	return checkAccess(node, caller)
+}
+
+func (r *fileRegistry) createFile(metadata *cnpb.FileMetadata, owner string) error {
+	return r.insert(metadata.Path, &namespaceNode{metadata: metadata, owner: owner})
+}
+
+func (r *fileRegistry) mkdir(path string, createdAtUnix int64, owner string) error {
+	return r.insert(path, newDirNode(createdAtUnix, owner))
+}
+
 func (r *fileRegistry) remove(path string, validate func(*namespaceNode) error) error {
 	parts := splitPath(path)
 	if len(parts) == 0 {
@@ -409,7 +447,6 @@ func (r *fileRegistry) remove(path string, validate func(*namespaceNode) error) 
 	return nil
 }
 
-// rmdir removes an empty directory.
 func (r *fileRegistry) rmdir(path string) error {
 	return r.remove(path, func(node *namespaceNode) error {
 		if !node.isDir {
@@ -422,7 +459,6 @@ func (r *fileRegistry) rmdir(path string) error {
 	})
 }
 
-// deleteFile removes a file entry from the namespace.
 func (r *fileRegistry) deleteFile(path string) error {
 	return r.remove(path, func(node *namespaceNode) error {
 		if node.isDir {
@@ -432,8 +468,7 @@ func (r *fileRegistry) deleteFile(path string) error {
 	})
 }
 
-// get returns a copy of the metadata stored for the file at path.
-func (r *fileRegistry) get(path string) (*cnpb.FileMetadata, error) {
+func (r *fileRegistry) get(path string, caller string) (*cnpb.FileMetadata, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -444,11 +479,13 @@ func (r *fileRegistry) get(path string) (*cnpb.FileMetadata, error) {
 	if node.isDir {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is a directory", path)
 	}
+	if err := checkAccess(node, caller); err != nil {
+		return nil, err
+	}
 	return proto.Clone(node.metadata).(*cnpb.FileMetadata), nil
 }
 
-// list returns the entries of the directory at path, sorted by name.
-func (r *fileRegistry) list(path string) ([]*cnpb.DirectoryEntry, error) {
+func (r *fileRegistry) list(path string, caller string) ([]*cnpb.DirectoryEntry, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -458,6 +495,9 @@ func (r *fileRegistry) list(path string) ([]*cnpb.DirectoryEntry, error) {
 	}
 	if !dir.isDir {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is not a directory", path)
+	}
+	if err := checkAccess(dir, caller); err != nil {
+		return nil, err
 	}
 
 	names := make([]string, 0, len(dir.children))
@@ -568,6 +608,11 @@ func (s *controlNodeServer) RequestNodeIPs(
 		return nil, err
 	}
 
+	caller := security.UserFromContext(ctx)
+	if err := s.files.checkParentAccess(filePath, caller); err != nil {
+		return nil, err
+	}
+
 	activeIPs := s.registry.activeAddresses()
 	nodeNumber := len(activeIPs)
 	if nodeNumber == 0 {
@@ -580,7 +625,6 @@ func (s *controlNodeServer) RequestNodeIPs(
 		IPAddress = append(IPAddress, &pb.ReplicaSet{NodeIps: chunkIPs})
 	}
 
-	// Inside RequestNodeIPs after creating allocations:
 	chunks := make([]*cnpb.ChunkAllocation, 0, len(allocations))
 	for chunkIndex, chunkIPs := range allocations {
 		chunks = append(chunks, &cnpb.ChunkAllocation{
@@ -595,7 +639,7 @@ func (s *controlNodeServer) RequestNodeIPs(
 		TotalChunks:   req.ChunkNumber,
 		CreatedAtUnix: time.Now().Unix(),
 		Chunks:        chunks,
-	})
+	}, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -667,6 +711,10 @@ func (s *controlNodeServer) CreateFileEntry(
 	if err != nil {
 		return nil, err
 	}
+	caller := security.UserFromContext(ctx)
+	if err := s.files.checkParentAccess(filePath, caller); err != nil {
+		return nil, err
+	}
 	if req.Size < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must not be negative")
 	}
@@ -709,7 +757,7 @@ func (s *controlNodeServer) CreateFileEntry(
 		Chunks:        chunks,
 	}
 	responseChunks := proto.Clone(metadata).(*cnpb.FileMetadata).Chunks
-	createFileCommand, err := newCreateFileCommand(metadata)
+	createFileCommand, err := newCreateFileCommand(metadata, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -740,7 +788,8 @@ func (s *controlNodeServer) GetFileMetadata(
 		return nil, err
 	}
 
-	metadata, err := s.files.get(filePath)
+	caller := security.UserFromContext(ctx)
+	metadata, err := s.files.get(filePath, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -762,8 +811,9 @@ func (s *controlNodeServer) ListDirectory(
 		return nil, err
 	}
 	dirPath := cleanDirPath(req.Path)
+	caller := security.UserFromContext(ctx)
 
-	entries, err := s.files.list(dirPath)
+	entries, err := s.files.list(dirPath, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -786,6 +836,11 @@ func (s *controlNodeServer) DeleteFile(
 		return nil, err
 	}
 
+	caller := security.UserFromContext(ctx)
+	if err := s.files.checkNodeAccess(filePath, caller); err != nil {
+		return nil, err
+	}
+
 	if err := s.consensus.apply(ctx, fsmCommand{Type: commandDeleteFile, Path: filePath}); err != nil {
 		return nil, err
 	}
@@ -805,6 +860,10 @@ func (s *controlNodeServer) DeleteDirectory(
 		return cnpb.NewFileMetadataServiceClient(leaderConnection).DeleteDirectory(forwardedCtx, req)
 	}
 	dirPath := cleanDirPath(req.Path)
+	caller := security.UserFromContext(ctx)
+	if err := s.files.checkNodeAccess(dirPath, caller); err != nil {
+		return nil, err
+	}
 
 	if err := s.consensus.apply(ctx, fsmCommand{Type: commandDeleteDirectory, Path: dirPath}); err != nil {
 		return nil, err
@@ -825,8 +884,12 @@ func (s *controlNodeServer) CreateDirectory(
 		return cnpb.NewFileMetadataServiceClient(leaderConnection).CreateDirectory(forwardedCtx, req)
 	}
 	dirPath := cleanDirPath(req.Path)
+	caller := security.UserFromContext(ctx)
+	if err := s.files.checkParentAccess(dirPath, caller); err != nil {
+		return nil, err
+	}
 
-	createDirectoryCommand := fsmCommand{Type: commandCreateDirectory, Path: dirPath, CreatedAtUnix: time.Now().Unix()}
+	createDirectoryCommand := fsmCommand{Type: commandCreateDirectory, Path: dirPath, Owner: caller, CreatedAtUnix: time.Now().Unix()}
 	if err := s.consensus.apply(ctx, createDirectoryCommand); err != nil {
 		return nil, err
 	}

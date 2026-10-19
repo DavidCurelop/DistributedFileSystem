@@ -17,6 +17,8 @@ import (
 // DefaultAuthToken is used when no token is configured. It is public, so any
 // real deployment should override it with -auth-token or AUTH_TOKEN.
 const DefaultAuthToken = "dfsha-secret-token"
+const UserHeader = "x-dfs-user"
+const DefaultUser = "default"
 
 const (
 	authorizationHeader = "authorization"
@@ -87,32 +89,56 @@ func StreamServerInterceptor(expectedToken string) grpc.StreamServerInterceptor 
 // connection without transport security.
 type TokenCredentials struct {
 	token string
+	user  string
 }
 
 var _ credentials.PerRPCCredentials = TokenCredentials{}
 
-// NewTokenCredentials returns per-RPC credentials carrying token.
 func NewTokenCredentials(token string) TokenCredentials {
-	return TokenCredentials{token: token}
+	return TokenCredentials{token: token, user: DefaultUser}
+}
+
+func NewUserTokenCredentials(token, user string) TokenCredentials {
+	if strings.TrimSpace(user) == "" {
+		user = DefaultUser
+	}
+	return TokenCredentials{token: token, user: user}
 }
 
 func (c TokenCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
-	return map[string]string{authorizationHeader: "Bearer " + c.token}, nil
+	return map[string]string{
+		authorizationHeader: "Bearer " + c.token,
+		UserHeader:          c.user,
+	}, nil
 }
 
 func (c TokenCredentials) RequireTransportSecurity() bool { return true }
 
-// ClientDialOptions returns the dial options every outgoing connection must use:
-// TLS transport credentials plus automatic token attachment.
-func ClientDialOptions(caFile, token string) ([]grpc.DialOption, error) {
+func UserFromContext(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return DefaultUser
+	}
+	users := md.Get(UserHeader)
+	if len(users) == 0 || strings.TrimSpace(users[0]) == "" {
+		return DefaultUser
+	}
+	return strings.TrimSpace(users[0])
+}
+
+func ClientDialOptionsWithUser(caFile, token, user string) ([]grpc.DialOption, error) {
 	transport, err := ClientCredentials(caFile)
 	if err != nil {
 		return nil, err
 	}
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(transport),
-		grpc.WithPerRPCCredentials(NewTokenCredentials(token)),
+		grpc.WithPerRPCCredentials(NewUserTokenCredentials(token, user)),
 	}, nil
+}
+
+func ClientDialOptions(caFile, token string) ([]grpc.DialOption, error) {
+	return ClientDialOptionsWithUser(caFile, token, DefaultUser)
 }
 
 // ServerOptions returns the options every gRPC server must use: TLS

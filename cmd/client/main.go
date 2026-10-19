@@ -36,6 +36,7 @@ var dialOptions []grpc.DialOption
 
 type clientApp struct {
 	controlNodeConn *grpc.ClientConn
+	cwd             string
 }
 
 func main() {
@@ -43,13 +44,14 @@ func main() {
 	controlNodeAddress := flag.String("ctrlAdd", config.EnvString("CONTROL_ADDR", "localhost:50051"), "Comma-separated ControlNode addresses, host[:port] (env CONTROL_ADDR)")
 	authToken := flag.String("auth-token", config.EnvString("AUTH_TOKEN", security.DefaultAuthToken), "Token sent to the ControlNode and DataNodes (env AUTH_TOKEN)")
 	tlsCA := flag.String("tls-ca", config.EnvString("TLS_CA_FILE", ""), "CA PEM file used to verify server certificates; empty skips verification (env TLS_CA_FILE)")
+	userFlag := flag.String("user", config.EnvString("DFS_USER", security.DefaultUser), "Username for file ownership and access control (env DFS_USER)")
 	flag.Parse()
 
 	if err := security.ValidateToken(*authToken); err != nil {
 		log.Fatalf("invalid auth token: %v", err)
 	}
 	var err error
-	dialOptions, err = security.ClientDialOptions(*tlsCA, *authToken)
+	dialOptions, err = security.ClientDialOptionsWithUser(*tlsCA, *authToken, *userFlag)
 	if err != nil {
 		log.Fatalf("configuring TLS: %v", err)
 	}
@@ -65,7 +67,10 @@ func main() {
 	}
 	defer controlNodeConn.Close()
 
-	app := &clientApp{controlNodeConn: controlNodeConn}
+	app := &clientApp{
+		controlNodeConn: controlNodeConn,
+		cwd:             "/",
+	}
 	if len(flag.Args()) > 0 {
 		err := app.dispatchCommand(ctx, flag.Args())
 		if err != nil {
@@ -76,8 +81,48 @@ func main() {
 	runInteractiveShell(ctx, app)
 }
 
+func (app *clientApp) resolvePath(p string) string {
+	if p == "" {
+		if app.cwd == "" {
+			return "/"
+		}
+		return app.cwd
+	}
+	if strings.HasPrefix(p, "/") {
+		return path.Clean(p)
+	}
+	base := app.cwd
+	if base == "" {
+		base = "/"
+	}
+	return path.Clean(path.Join(base, p))
+}
+
+func (app *clientApp) handleCd(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		app.cwd = "/"
+		return nil
+	}
+	targetPath := app.resolvePath(args[0])
+	if targetPath == "/" {
+		app.cwd = "/"
+		return nil
+	}
+	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
+	_, err := client.ListDirectory(ctx, &cnpb.ListDirectoryRequest{Path: targetPath})
+	if err != nil {
+		return fmt.Errorf("cd %s: %w", targetPath, err)
+	}
+	app.cwd = targetPath
+	return nil
+}
+
+func (app *clientApp) handlePwd() error {
+	fmt.Println(app.cwd)
+	return nil
+}
+
 func (app *clientApp) dispatchCommand(ctx context.Context, commandTokens []string) error {
-	// Guard clause: empty input
 	if len(commandTokens) == 0 {
 		return nil
 	}
@@ -90,6 +135,10 @@ func (app *clientApp) dispatchCommand(ctx context.Context, commandTokens []strin
 		return app.handleGet(ctx, commandArgs)
 	case "ls":
 		return app.handleList(ctx, commandArgs)
+	case "cd":
+		return app.handleCd(ctx, commandArgs)
+	case "pwd":
+		return app.handlePwd()
 	case "mkdir":
 		return app.handleMkdir(ctx, commandArgs)
 	case "rmdir":
@@ -100,14 +149,15 @@ func (app *clientApp) dispatchCommand(ctx context.Context, commandTokens []strin
 		os.Exit(0)
 		return nil
 	default:
-		return fmt.Errorf("unknown command: %q (supported: put, get, ls, mkdir, rmdir, rm, exit)", commandName)
+		return fmt.Errorf("unknown command: %q (supported: put, get, ls, cd, pwd, mkdir, rmdir, rm, exit)", commandName)
 	}
 }
+
 func runInteractiveShell(ctx context.Context, app *clientApp) {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		fmt.Print("dfsha> ")
+		fmt.Printf("dfsha:%s> ", app.cwd)
 		input := scanner.Scan()
 		if !input {
 			break
@@ -121,19 +171,15 @@ func runInteractiveShell(ctx context.Context, app *clientApp) {
 		cancel()
 	}
 }
+
 func (app *clientApp) handlePut(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: put <file_path>")
 	}
 	localSourcePath := args[0]
-	//fileName := filepath.Base(localSourcePath)
-	dfsPath := "/"
+	dfsPath := path.Join(app.cwd, filepath.Base(localSourcePath))
 	if len(args) >= 2 {
-		dfsPath = path.Join(args[1], filepath.Base(localSourcePath))
-	}
-
-	if len(args) == 1 {
-		dfsPath = path.Join(dfsPath, filepath.Base(localSourcePath))
+		dfsPath = path.Join(app.resolvePath(args[1]), filepath.Base(localSourcePath))
 	}
 
 	// Measure size of local source file
@@ -173,13 +219,12 @@ func (app *clientApp) handleGet(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: get <remote_path> [local_path]")
 	}
-	remotePath := args[0]
+	remotePath := app.resolvePath(args[0])
 
 	localPath := filepath.Base(remotePath)
 	if len(args) >= 2 {
 		localPath = args[1]
 	}
-	// Like cp: downloading into an existing directory keeps the remote file name.
 	if info, err := os.Stat(localPath); err == nil && info.IsDir() {
 		localPath = filepath.Join(localPath, filepath.Base(remotePath))
 	}
@@ -190,10 +235,11 @@ func (app *clientApp) handleGet(ctx context.Context, args []string) error {
 	fmt.Printf("downloaded %s to %s\n", remotePath, localPath)
 	return nil
 }
+
 func (app *clientApp) handleList(ctx context.Context, args []string) error {
-	tagetDirPath := "/"
+	tagetDirPath := app.cwd
 	if len(args) > 0 {
-		tagetDirPath = args[0]
+		tagetDirPath = app.resolvePath(args[0])
 	}
 	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 	listDirectoryResponse, err := client.ListDirectory(ctx, &cnpb.ListDirectoryRequest{Path: tagetDirPath})
@@ -220,11 +266,12 @@ func (app *clientApp) handleList(ctx context.Context, args []string) error {
 
 	return nil
 }
+
 func (app *clientApp) handleRemove(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: rm <file_path>")
 	}
-	filePath := args[0]
+	filePath := app.resolvePath(args[0])
 
 	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 	deleteFileResponse, err := client.DeleteFile(ctx, &cnpb.DeleteFileRequest{Path: filePath})
@@ -246,7 +293,7 @@ func (app *clientApp) handleMkdir(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: mkdir <directory_path>")
 	}
-	dirPath := args[0]
+	dirPath := app.resolvePath(args[0])
 
 	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 
@@ -270,7 +317,7 @@ func (app *clientApp) handleRmdir(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: rmdir <directory_path>")
 	}
 
-	dirPath := args[0]
+	dirPath := app.resolvePath(args[0])
 
 	client := cnpb.NewFileMetadataServiceClient(app.controlNodeConn)
 

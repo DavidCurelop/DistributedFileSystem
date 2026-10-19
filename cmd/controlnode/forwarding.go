@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"distributedFileSystem/pkg/security"
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -54,7 +55,7 @@ func (s *controlNodeServer) leaderConnection(ctx context.Context) (*grpc.ClientC
 	if err != nil {
 		return nil, nil, status.Error(codes.Unavailable, err.Error())
 	}
-	forwardedCtx := metadata.AppendToOutgoingContext(ctx, forwardedHeader, "true")
+	forwardedCtx := metadata.AppendToOutgoingContext(ctx, forwardedHeader, "true", security.UserHeader, security.UserFromContext(ctx))
 	return leaderConnection, forwardedCtx, nil
 }
 
